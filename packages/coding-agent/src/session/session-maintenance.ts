@@ -1726,7 +1726,11 @@ export class SessionMaintenance {
 		// will actually rewrite history; awaiting it on every ordinary tool turn lets
 		// a slow message_end listener leave the TUI "generating" with no provider
 		// request or tool running.
-		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
+		const compactionEntry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
+		const assistantPredatesCompaction =
+			compactionEntry !== null && lastAssistant.timestamp < new Date(compactionEntry.timestamp).getTime();
+		// Retained assistants still carry their pre-rewrite provider usage.
+		const billedContextTokens = assistantPredatesCompaction ? 0 : calculateContextTokens(lastAssistant.usage);
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) {

@@ -94,6 +94,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			extensionRunner?: ExtensionRunner;
 			onProviderCall?: (index: number) => void;
 			configureAgent?: (agent: Agent) => void;
+			toolTurnTimestamp?: number;
 			toolResultDetails?: unknown;
 		} = {},
 	): Promise<{
@@ -153,7 +154,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 							model: "claude-sonnet-4-5",
 							usage: highUsage(50_000),
 							stopReason: "toolUse" as const,
-							timestamp: Date.now(),
+							timestamp: options.toolTurnTimestamp ?? Date.now(),
 						}
 					: {
 							role: "assistant" as const,
@@ -218,6 +219,25 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
 		expect(observedContexts[1].join("\n")).toContain("ACTIVE-GOAL-MID-RUN-COMPACTED");
+	});
+
+	it("ignores stale billed usage from before the latest compaction at a tool boundary", async () => {
+		const toolTurnTimestamp = Date.now() - 1_000;
+		const { session, sessionManager } = await createHarness(
+			{ "compaction.asyncEnabled": false },
+			{ toolTurnTimestamp },
+		);
+		const firstKeptEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: "kept after compaction",
+			timestamp: toolTurnTimestamp,
+		});
+		sessionManager.appendCompaction("Earlier work was compacted.", undefined, firstKeptEntryId, 50_000);
+		const compactSpy = mockCompaction("SHOULD-NOT-RUN");
+
+		await session.prompt("continue after compaction");
+
+		expect(compactSpy).not.toHaveBeenCalled();
 	});
 
 	it("does not wait for message persistence below the mid-run threshold", async () => {
