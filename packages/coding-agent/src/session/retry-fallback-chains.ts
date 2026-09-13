@@ -351,15 +351,44 @@ export function resolveRetryFallbackChainKey(
 	}
 	if (matchedRole) return matchedRole;
 
-	// 4. The default chain, when default has no explicit role primary.
-	const defaultChain = context.chains.default;
-	if (
-		Array.isArray(defaultChain) &&
-		defaultChain.length > 0 &&
-		getRetryFallbackPrimarySelector(context, "default") === undefined
-	) {
-		return "default";
+	// 4. A chain that merely CONTAINS the current model. The walk is otherwise
+	//    pinned only in `retryFallbackChainKeys`, which is process memory: a
+	//    session resumed while sitting on a fallback entry matches nothing above
+	//    and gets no chain, so the next hard error is terminal even though the
+	//    rest of the chain it was already inside is still untried. Wildcard
+	//    entries are skipped because they re-derive from the current model and
+	//    would therefore match every chain.
+	let containingKey: string | undefined;
+	for (const key in context.chains) {
+		const entries = context.chains[key];
+		if (!Array.isArray(entries)) continue;
+		const contains = entries.some(entry => {
+			if (isRetryFallbackWildcardKey(entry)) return false;
+			const parsed = parseRetryFallbackChainEntry(context, entry, parsedCurrent);
+			if (!parsed) return false;
+			const base = formatRetryFallbackBaseSelector(parsed);
+			return (
+				parsed.raw === currentSelector ||
+				parsed.raw === currentPlainSelector ||
+				base === currentBaseSelector ||
+				base === currentPlainBaseSelector
+			);
+		});
+		if (!contains) continue;
+		if (key === "default") return "default";
+		containingKey ??= key;
 	}
+	if (containingKey) return containingKey;
+
+	// 5. The default chain as the floor. Covers both a `default` with no explicit
+	//    primary and a model belonging to no chain at all — a `--model` override,
+	//    or one persisted by a session whose provider has since left the config.
+	//    Without this an orphan model has no route off a dead provider: the hard
+	//    error ends the turn while every configured fallback sits untried. Such a
+	//    model is not in the chain, so the walk skips the primary and offers the
+	//    fallbacks.
+	const defaultChain = context.chains.default;
+	if (Array.isArray(defaultChain) && defaultChain.length > 0) return "default";
 	return undefined;
 }
 

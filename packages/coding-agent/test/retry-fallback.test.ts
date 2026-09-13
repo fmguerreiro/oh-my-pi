@@ -126,6 +126,32 @@ describe("retry fallback selector resolution", () => {
 		// Bare entries carry no level so the failing turn's effort applies at switch time.
 		expect(candidates[1]?.thinkingLevel).toBeUndefined();
 	});
+	it("resumes a chain the current model sits inside, not just one it heads", () => {
+		const context = createContext(
+			{ default: ["google/gemini-2.5-flash", "openai/gpt-4o-mini"] },
+			{ default: "openrouter/google/gemini-2.5-flash" },
+		);
+		// The pin that normally carries the walk is process memory, so a resumed
+		// session arrives on a middle entry with nothing else identifying its chain.
+		const chainKey = resolveRetryFallbackChainKey(context, "google/gemini-2.5-flash");
+		expect(chainKey).toBe("default");
+		expect(findRetryFallbackCandidates(context, "default", "google/gemini-2.5-flash")).toEqual([
+			{ raw: "openai/gpt-4o-mini", provider: "openai", id: "gpt-4o-mini", thinkingLevel: undefined },
+		]);
+	});
+
+	it("offers the default chain to a model no chain claims", () => {
+		const context = createContext(
+			{ default: ["google/gemini-2.5-flash", "openai/gpt-4o-mini"] },
+			{ default: "google-vertex/gemini-2.5-flash" },
+		);
+		const orphan = "openrouter/google/gemini-2.5-flash";
+		expect(resolveRetryFallbackChainKey(context, orphan)).toBe("default");
+		expect(findRetryFallbackCandidates(context, "default", orphan)).toEqual([
+			{ raw: "google/gemini-2.5-flash", provider: "google", id: "gemini-2.5-flash", thinkingLevel: undefined },
+			{ raw: "openai/gpt-4o-mini", provider: "openai", id: "gpt-4o-mini", thinkingLevel: undefined },
+		]);
+	});
 
 	it("inherits the default chain only for roles without an explicit chain", () => {
 		const defaultChain = ["openai/gpt-4o-mini"];
