@@ -193,6 +193,36 @@ describe("postmortem expected cleanup errors", () => {
 		expect(result.stderr).toContain("[Recovery]\n  Main: omp --resume 019cafe0-dead-beef");
 	});
 
+	it("reports one fatal when further exceptions arrive while cleanup is draining", async () => {
+		const result = await runPostmortemProbe(`
+			import { postmortem } from "${postmortemModuleUrl}";
+
+			postmortem.registerFatalRecoveryHint(() => ({
+				label: "Main",
+				command: "omp --resume 019cafe0-dead-beef",
+			}));
+			postmortem.register("teardown", async () => {
+				for (let index = 0; index < 3; index++) {
+					queueMicrotask(() => {
+						throw Object.assign(new Error("broken pipe, write"), { code: "EPIPE", syscall: "write" });
+					});
+				}
+				// Yield so those microtasks run inside this pass.
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			queueMicrotask(() => {
+				throw new Error("first fatal");
+			});
+			await Promise.withResolvers<void>().promise;
+		`);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("[Uncaught Exception] Error: first fatal");
+		expect(result.stderr.split("[Uncaught Exception]").length - 1).toBe(1);
+		expect(result.stderr.split("[Recovery]").length - 1).toBe(1);
+	});
+
 	it("exits after an uncaught exception when terminal stderr is revoked", async () => {
 		const result = await runPostmortemProbe(`
 			import { spyOn } from "bun:test";

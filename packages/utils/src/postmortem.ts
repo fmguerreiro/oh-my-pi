@@ -457,7 +457,17 @@ function formatFatalError(label: string, err: Error): string {
 	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
 }
 
+/** The first fatal owns stderr and the exit deadline; later ones must not print their own report. */
+let fatalReportEmitted = false;
+
 async function exitAfterFatal(output: string, logMessage: string, err: Error, reason: Reason): Promise<never> {
+	if (fatalReportEmitted) {
+		logger.error(`${logMessage} while already exiting after an earlier fatal`, { err });
+		// Join the in-flight pass so a caller awaiting `fatal()` does not hang until its deadline.
+		await runCleanup(reason);
+		exitProcess(1);
+	}
+	fatalReportEmitted = true;
 	const forcedExit = setTimeout(() => exitProcess(1), CLEANUP_DEADLINE_MS);
 	try {
 		// Cleanup callbacks are invoked synchronously before runCleanup returns its
