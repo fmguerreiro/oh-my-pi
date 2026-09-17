@@ -2106,9 +2106,40 @@ export class EventController {
 		return this.ctx.focusedAgentId ? "" : " (esc to cancel)";
 	}
 
+	/**
+	 * Log a maintenance lifecycle event's arrival in the TUI, then again once the
+	 * frame carrying it paints. `session-maintenance.ts` logs the same event at
+	 * the emit site, so the three lines separate source→handler delivery from
+	 * handler→paint: an indicator left on screen is otherwise indistinguishable
+	 * from one whose state cleared but never repainted. Only the emit-site line
+	 * covers every session in the process; this controller is subscribed to one
+	 * session, so these two speak only for it.
+	 */
+	#logMaintenanceHandled(event: "auto_compaction_start" | "auto_compaction_end", action: string): void {
+		const sessionId = this.ctx.viewSession.sessionId;
+		const handledAt = Date.now();
+		logger.debug("compaction lifecycle handled", { event, sessionId, action });
+		this.ctx.ui.onNextFrame(() => {
+			// A frame painted after this event was handled is not proof the event's
+			// state reached the screen: a whole start/end cycle can land between two
+			// frames, and then both callbacks drain on the one frame that shows the
+			// final state only. Compare against the live loader so the line says
+			// which of the two it was instead of leaving the reader to infer it.
+			const loaderInstalled = this.ctx.autoCompactionLoader !== undefined;
+			logger.debug("compaction lifecycle painted", {
+				event,
+				sessionId,
+				action,
+				paintLatencyMs: Date.now() - handledAt,
+				stateHeldAtPaint: event === "auto_compaction_start" ? loaderInstalled : !loaderInstalled,
+			});
+		});
+	}
+
 	async #handleAutoCompactionStart(
 		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" }>,
 	): Promise<void> {
+		this.#logMaintenanceHandled("auto_compaction_start", event.action);
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
 		this.#setTerminalProgress(true);
@@ -2144,13 +2175,26 @@ export class EventController {
 	}
 
 	async #handleAutoCompactionEnd(event: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>): Promise<void> {
+		this.#logMaintenanceHandled("auto_compaction_end", event.action);
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
 		this.#setTerminalProgress(false);
+		const hadLoader = this.ctx.autoCompactionLoader !== undefined;
 		if (this.ctx.autoCompactionLoader) {
 			this.ctx.autoCompactionLoader.stop();
 			this.ctx.autoCompactionLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
+		}
+		// The start handler always installs a loader, and this controller is
+		// subscribed to exactly one session at a time, so no loader here means this
+		// subscription never saw the matching start: either a second end for one
+		// start (several emit sites can produce one), or an end for a session
+		// focus switched to mid-run.
+		if (!hadLoader) {
+			logger.debug("compaction lifecycle end with no matching start", {
+				action: event.action,
+				sessionId: this.ctx.viewSession.sessionId,
+			});
 		}
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";

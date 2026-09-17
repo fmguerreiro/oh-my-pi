@@ -603,6 +603,18 @@ export class SessionMaintenance {
 	 * before maintenance returns.
 	 */
 	#emitLifecycleEvent(event: AgentSessionEvent, detach: boolean): Promise<void> {
+		// One process multiplexes the parent session and every in-process subagent,
+		// and these lines carried no session key, so a maintenance indicator left on
+		// screen could not be told from a legitimate back-to-back run in a sibling
+		// session. Log both ends against the session for that pairing.
+		if (event.type === "auto_compaction_start" || event.type === "auto_compaction_end") {
+			logger.debug("compaction lifecycle", {
+				event: event.type,
+				sessionId: this.#host.sessionId(),
+				action: event.action,
+				detach,
+			});
+		}
 		return this.#host.emitSessionEvent(event, detach ? { detachExtensions: true } : undefined);
 	}
 	/**
