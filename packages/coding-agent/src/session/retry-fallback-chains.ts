@@ -392,7 +392,12 @@ export function resolveRetryFallbackChainKey(
 	//    and gets no chain, so the next hard error is terminal even though the
 	//    rest of the chain it was already inside is still untried. Wildcard
 	//    entries are skipped because they re-derive from the current model and
-	//    would therefore match every chain.
+	//    would therefore match every chain. Effort-insensitive to match how
+	//    `findRetryFallbackCandidates` positions the walk.
+	const currentBaseSelector = formatRetryFallbackBaseSelector(parsedCurrent);
+	const currentPlainBaseSelector = parsedPlainCurrent
+		? formatRetryFallbackBaseSelector(parsedPlainCurrent)
+		: undefined;
 	let containingKey: string | undefined;
 	for (const key in context.chains) {
 		const entries = context.chains[key];
@@ -402,12 +407,7 @@ export function resolveRetryFallbackChainKey(
 			const parsed = parseRetryFallbackChainEntry(context, entry, parsedCurrent);
 			if (!parsed) return false;
 			const base = formatRetryFallbackBaseSelector(parsed);
-			return (
-				parsed.raw === currentSelector ||
-				parsed.raw === currentPlainSelector ||
-				base === currentBaseSelector ||
-				base === currentPlainBaseSelector
-			);
+			return base === currentBaseSelector || base === currentPlainBaseSelector;
 		});
 		if (!contains) continue;
 		if (key === "default") return "default";

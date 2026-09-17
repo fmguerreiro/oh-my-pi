@@ -140,6 +140,15 @@ describe("retry fallback selector resolution", () => {
 		]);
 	});
 
+	it("resumes a chain whose entry names the same model at a different effort", () => {
+		const context = createContext(
+			{ task: ["google/gemini-2.5-flash:low", "openai/gpt-4o-mini"] },
+			{ task: "openai/gpt-4o-mini" },
+		);
+		// No default chain, so only the containment pass can claim this model.
+		expect(resolveRetryFallbackChainKey(context, "google/gemini-2.5-flash:high")).toBe("task");
+	});
+
 	it("offers the default chain to a model no chain claims", () => {
 		const context = createContext(
 			{ default: ["google/gemini-2.5-flash", "openai/gpt-4o-mini"] },
