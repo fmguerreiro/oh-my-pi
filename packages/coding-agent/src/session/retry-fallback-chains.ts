@@ -393,6 +393,10 @@ export function resolveRetryFallbackChainKey(
 	//    rest of the chain it was already inside is still untried. Wildcard
 	//    entries are skipped because they re-derive from the current model and
 	//    would therefore match every chain.
+	const currentBaseSelector = formatRetryFallbackBaseSelector(parsedCurrent);
+	const currentPlainBaseSelector = parsedPlainCurrent
+		? formatRetryFallbackBaseSelector(parsedPlainCurrent)
+		: undefined;
 	let containingKey: string | undefined;
 	for (const key in context.chains) {
 		const entries = context.chains[key];
