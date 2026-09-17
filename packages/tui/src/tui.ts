@@ -2151,6 +2151,19 @@ export class TUI extends Container {
 		this.#renderTimer = this.#renderScheduler.scheduleRender(this.#runScheduledRender, delay);
 	}
 
+	/** One-shot callbacks to run after the next painted frame. */
+	#nextFrameCallbacks: (() => void)[] = [];
+
+	/**
+	 * Run `callback` once, after the next frame actually paints. Renders are
+	 * deferred by cadence, adaptive backpressure and output backlog, so "render
+	 * requested" is not "on screen"; this is the only point that distinguishes
+	 * them for callers measuring how long a UI change took to become visible.
+	 */
+	onNextFrame(callback: () => void): void {
+		this.#nextFrameCallbacks.push(callback);
+	}
+
 	/**
 	 * Wrap `#doRender()` so every path records the wall-clock frame cost that
 	 * feeds adaptive backpressure. Set `#lastRenderAt` first (some render code
@@ -2162,6 +2175,11 @@ export class TUI extends Container {
 		this.#lastRenderAt = start;
 		this.#doRender();
 		this.#lastFrameCostMs = this.#renderScheduler.now() - start;
+		if (this.#nextFrameCallbacks.length > 0) {
+			const callbacks = this.#nextFrameCallbacks;
+			this.#nextFrameCallbacks = [];
+			for (const callback of callbacks) callback();
+		}
 	}
 	/**
 	 * True when the frame was deferred because the terminal's output backlog
