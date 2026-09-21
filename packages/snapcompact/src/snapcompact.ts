@@ -2080,7 +2080,7 @@ function stripThinkingSections(text: string): string {
 		.split(NEWLINE_GLYPH)
 		.map(segment =>
 			segment
-				.split(/\n\n(?=¶(?:user|think|ai|call):)/)
+				.split(/\n+(?=¶(?:user|think|ai|call):)/)
 				.filter(section => !section.startsWith("¶think:"))
 				.join("\n\n"),
 		)
@@ -2110,7 +2110,20 @@ export async function compact<TMessage = Message>(
 		throw new Error("First kept entry has no ID - session may need migration");
 	}
 	const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
-	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
+	const llmMessagesRaw = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
+	const llmMessages =
+		options?.includeThinking === false
+			? llmMessagesRaw.map(message => {
+					if (message.role !== "user" || message.historyRewriteAt === undefined) return message;
+					const content =
+						typeof message.content === "string"
+							? stripThinkingSections(message.content)
+							: message.content.map(block =>
+									block.type === "text" ? { ...block, text: stripThinkingSections(block.text) } : block,
+								);
+					return { ...message, content };
+				})
+			: llmMessagesRaw;
 	const serialized = serializeConversation(llmMessages, options);
 	const previousArchive = getPreservedArchive(previousPreserveData);
 	const previousTextRaw =

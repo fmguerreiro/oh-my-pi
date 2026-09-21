@@ -1116,6 +1116,61 @@ describe("compact", () => {
 		expect(archiveText).toContain("The token clock is skewed.");
 	});
 
+	it("scrubs reasoning nested in a typed compaction summary before rendering", async () => {
+		const reasoningSentinel = "NESTED_ASSISTANT_REASONING_7B19";
+		const userLookalike = "before\n\n¶think: quoted prose\n\n¶ai:after";
+		const prefix = `¶user:${"Earlier visible context. ".repeat(120)}`;
+		const suffix = `¶ai:${"Later visible response. ".repeat(120)}`;
+		const cleanArchive = `${prefix}\n${suffix}`;
+		const poisonedArchive = `${prefix}\n¶think:${reasoningSentinel}\n${suffix}`;
+		type NestedMessage =
+			| Message
+			| { role: "compactionSummary"; summary: string; blocks: { type: "text"; text: string }[]; timestamp: number };
+		const run = (archiveText: string) =>
+			snapcompact.compact<NestedMessage>(
+				{
+					...makePreparation(),
+					messagesToSummarize: [
+						{
+							role: "compactionSummary",
+							summary: "Prior compacted history follows.",
+							blocks: [{ type: "text", text: archiveText }],
+							timestamp: 0,
+						},
+						createUserMessage(userLookalike),
+					],
+				},
+				{
+					model: { api: "anthropic-messages" },
+					frameSize: TEST_FRAME_SIZE,
+					maxFrames: 5,
+					includeThinking: false,
+					convertToLlm: messages =>
+						messages.map(message =>
+							message.role === "compactionSummary"
+								? {
+										role: "user" as const,
+										content: [{ type: "text" as const, text: message.summary }, ...message.blocks],
+										attribution: "agent" as const,
+										historyRewriteAt: message.timestamp,
+										timestamp: message.timestamp,
+									}
+								: message,
+						),
+				},
+			);
+
+		const poisoned = snapcompact.getPreservedArchive((await run(poisonedArchive)).preserveData);
+		const clean = snapcompact.getPreservedArchive((await run(cleanArchive)).preserveData);
+		expect(poisoned?.text).not.toContain(reasoningSentinel);
+		expect(poisoned?.text).toContain(
+			`before${snapcompact.NEWLINE_GLYPH}¶think: quoted prose${snapcompact.NEWLINE_GLYPH}¶ai:after`,
+		);
+		expect(poisoned?.frames.length).toBeGreaterThan(0);
+		expect(poisoned?.frames.map(frame => frame.data)).toEqual(clean?.frames.map(frame => frame.data));
+		expect(JSON.stringify(poisoned ? snapcompact.historyBlocks(poisoned) : [])).not.toContain(reasoningSentinel);
+	});
+
 	it("keeps legacy ¶think: sections when thinking stays included", async () => {
 		const first = await snapcompact.compact(
 			makePreparation({
