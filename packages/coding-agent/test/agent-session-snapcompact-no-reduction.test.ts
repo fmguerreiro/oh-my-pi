@@ -121,7 +121,7 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 		// Three frames ≈ 3 × FRAME_TOKEN_ESTIMATE, far more than the handful of
 		// tokens in the short summarized conversation — a genuine token increase.
 		const frame = { data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 } as const;
-		const compactSpy = vi.spyOn(snapcompact, "compact").mockResolvedValue({
+		const result: snapcompact.CompactionResult = {
 			summary: "archived onto frames",
 			shortSummary: "archived",
 			firstKeptEntryId: firstKeptEntry.id,
@@ -132,11 +132,20 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 			preserveData: {
 				snapcompact: { frames: [frame, frame, frame], totalChars: 12, truncatedChars: 0 },
 			},
+		};
+		let preflighted = false;
+		const compactSpy = vi.spyOn(snapcompact, "compact").mockImplementation(async (_preparation, options) => {
+			if (options?.beforeRender) {
+				preflighted = true;
+				options.beforeRender(result);
+			}
+			return result;
 		});
 
 		await expect(session.compact(undefined, { mode: "snapcompact" })).rejects.toThrow(
 			"snapcompact would not reduce context locally.",
 		);
+		expect(preflighted).toBe(true);
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(false);
 	});
@@ -147,7 +156,7 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 		if (!firstKeptEntry?.id) throw new Error("Expected branch entry with id");
 
 		const frame = { data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 } as const;
-		const compactSpy = vi.spyOn(snapcompact, "compact").mockResolvedValue({
+		const result: snapcompact.CompactionResult = {
 			summary: "archived onto frames",
 			shortSummary: "archived",
 			firstKeptEntryId: firstKeptEntry.id,
@@ -156,6 +165,14 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 			preserveData: {
 				snapcompact: { frames: [frame, frame, frame], totalChars: 12, truncatedChars: 0 },
 			},
+		};
+		let preflighted = false;
+		const compactSpy = vi.spyOn(snapcompact, "compact").mockImplementation(async (_preparation, options) => {
+			if (options?.beforeRender) {
+				preflighted = true;
+				options.beforeRender(result);
+			}
+			return result;
 		});
 
 		let rejectedInflatingSnapcompact = false;
@@ -169,6 +186,7 @@ describe("AgentSession snapcompact no-reduction guard", () => {
 			}
 		});
 		await session.prompt("pending ".repeat(190_000));
+		expect(preflighted).toBe(true);
 
 		expect(rejectedInflatingSnapcompact).toBe(true);
 		expect(compactSpy).toHaveBeenCalled();

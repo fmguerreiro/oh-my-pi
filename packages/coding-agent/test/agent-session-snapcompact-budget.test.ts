@@ -136,6 +136,8 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 			content: [{ type: "text", text: filler }],
 			timestamp: Date.now(),
 		});
+		const selectedShape = snapcompact.resolveShape(model, "silver16-bw");
+		vi.spyOn(snapcompact, "resolveShapeForText").mockReturnValue(selectedShape);
 
 		const branchEntries = sessionManager.getBranch();
 		const firstKeptEntry = branchEntries[branchEntries.length - 1];
@@ -172,8 +174,20 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		if (!preparation) throw new Error("Expected non-empty preparation");
 		let baseTokens = computeNonMessageTokens(session, session.agent.tokenizer, session.settings.revision);
 		baseTokens += session.agent.tokenizer.countMessages(preparation.recentMessages);
-		const shape = snapcompact.resolveShape(model);
-		const edgeCap = snapcompact.geometry(shape).capacity;
+		const edgeCap = snapcompact.geometry(selectedShape).capacity;
+		const capReserve = Math.ceil((2 * edgeCap * 1.15) / 4) + 2000;
+		const expectedMaxFrames = Math.max(
+			1,
+			Math.min(
+				Math.floor((budget - baseTokens - capReserve) / snapcompact.FRAME_TOKEN_ESTIMATE),
+				snapcompact.MAX_FRAMES_DEFAULT,
+				snapcompact.maxFramesForDataBudget(),
+				snapcompact.providerFrameBudget(model.provider),
+			),
+		);
+		expect(maxFrames).toBe(expectedMaxFrames);
+		expect(opts?.shape).toEqual(selectedShape);
+
 		// Worst-case `textHead + textTail` tokenized at the cl100k 4-chars/token
 		// baseline, plus a 2k allowance for the snapcompact summary template
 		// (intro + FILES section + grid notes).

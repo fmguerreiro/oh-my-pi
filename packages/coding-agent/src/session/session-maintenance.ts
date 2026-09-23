@@ -1250,7 +1250,11 @@ export class SessionMaintenance {
 			// this method, allowing the configured preference order to continue.
 			let snapcompactResult: snapcompact.CompactionResult | undefined;
 			if (snapcompactReady) {
-				const maxFrames = this.#computeSnapcompactMaxFrames(preparation, effectiveSettings);
+				const shape = snapcompactShape;
+				if (!shape) {
+					throw new Error("snapcompact shape was not resolved before rendering.");
+				}
+				const maxFrames = this.#computeSnapcompactMaxFrames(preparation, effectiveSettings, shape);
 				if (maxFrames < 1) {
 					logger.warn("Snapcompact skipped: kept history alone exceeds the context budget", {
 						model: this.#model?.id,
@@ -1262,16 +1266,53 @@ export class SessionMaintenance {
 					);
 					throw new Error("snapcompact cannot run locally: kept history alone exceeds the context budget.");
 				} else {
-					const shape = snapcompactShape;
-					if (!shape) {
-						throw new Error("snapcompact shape was not resolved before rendering.");
-					}
+					const ctxWindow = this.#model?.contextWindow ?? 0;
+					const budget =
+						ctxWindow > 0
+							? ctxWindow - effectiveReserveTokens(ctxWindow, effectiveSettings)
+							: Number.POSITIVE_INFINITY;
+					const reductionBaseline = this.#projectPreSnapcompactContextTokens(preparation);
+					let projectionChecked = false;
+					const validateProjection = (result: snapcompact.CompactionResult): void => {
+						projectionChecked = true;
+						const projected = this.#projectSnapcompactContextTokens(preparation, result);
+						// No-reduction decision runs in the encrypted-reasoning-excluded domain
+						// on both sides: opaque replay signatures (thinkingSignature /
+						// redactedThinking) have no trustworthy local token price, so counting
+						// them in the archived region's baseline while the imaged projection
+						// drops them lets an inflating result pass the guard (#10716). The
+						// window-fit check below keeps the conservative `projected`.
+						const projectedForReduction = this.#projectSnapcompactContextTokens(preparation, result, {
+							excludeEncryptedReasoning: true,
+						});
+						if (projectedForReduction >= reductionBaseline) {
+							logger.warn("Snapcompact projection would not reduce context", {
+								model: this.#model?.id,
+								projected: projectedForReduction,
+								reductionBaseline,
+							});
+							this.#host.emitNotice("warning", "snapcompact would not reduce context.", "compaction");
+							throw new Error("snapcompact would not reduce context locally.");
+						}
+						if (projected > budget) {
+							logger.warn("Snapcompact still overflows the window after frame-budget sizing", {
+								model: this.#model?.id,
+							});
+							this.#host.emitNotice(
+								"warning",
+								"snapcompact could not bring the context under the limit.",
+								"compaction",
+							);
+							throw new Error("snapcompact could not bring the context under the limit locally.");
+						}
+					};
 					snapcompactResult = await snapcompact.compact(preparation, {
 						convertToLlm,
 						model: this.#model,
-						...(snapcompactShapeSetting === "auto" ? {} : { shape }),
+						shape,
 						maxFrames,
 						includeThinking: snapcompactIncludeThinking,
+						beforeRender: validateProjection,
 					});
 					const framePayloadBytes = this.#snapcompactFramePayloadBytes(snapcompactResult);
 					if (framePayloadBytes > snapcompact.FRAME_DATA_BYTES_BUDGET) {
@@ -1289,42 +1330,7 @@ export class SessionMaintenance {
 							"snapcompact cannot run locally: standing image payload exceeds the per-request budget.",
 						);
 					}
-					const ctxWindow = this.#model?.contextWindow ?? 0;
-					const budget =
-						ctxWindow > 0
-							? ctxWindow - effectiveReserveTokens(ctxWindow, effectiveSettings)
-							: Number.POSITIVE_INFINITY;
-					const projected = this.#projectSnapcompactContextTokens(preparation, snapcompactResult);
-					// No-reduction decision runs in the encrypted-reasoning-excluded domain
-					// on both sides: opaque replay signatures (thinkingSignature /
-					// redactedThinking) have no trustworthy local token price, so counting
-					// them in the archived region's baseline while the imaged projection
-					// drops them lets an inflating result pass the guard (#10716). The
-					// window-fit check below keeps the conservative `projected`.
-					const projectedForReduction = this.#projectSnapcompactContextTokens(preparation, snapcompactResult, {
-						excludeEncryptedReasoning: true,
-					});
-					const reductionBaseline = this.#projectPreSnapcompactContextTokens(preparation);
-					if (projectedForReduction >= reductionBaseline) {
-						logger.warn("Snapcompact projection would not reduce context", {
-							model: this.#model?.id,
-							projected: projectedForReduction,
-							reductionBaseline,
-						});
-						this.#host.emitNotice("warning", "snapcompact would not reduce context.", "compaction");
-						throw new Error("snapcompact would not reduce context locally.");
-					}
-					if (projected > budget) {
-						logger.warn("Snapcompact still overflows the window after frame-budget sizing", {
-							model: this.#model?.id,
-						});
-						this.#host.emitNotice(
-							"warning",
-							"snapcompact could not bring the context under the limit.",
-							"compaction",
-						);
-						throw new Error("snapcompact could not bring the context under the limit locally.");
-					}
+					if (!projectionChecked) validateProjection(snapcompactResult);
 				}
 			}
 
@@ -3419,7 +3425,11 @@ export class SessionMaintenance {
 	 * ~402k frame-token projection always overflows any sub-1M-token window
 	 * (issue #3247).
 	 */
-	#computeSnapcompactMaxFrames(preparation: CompactionPreparation, settings: EngineCompactionSettings): number {
+	#computeSnapcompactMaxFrames(
+		preparation: CompactionPreparation,
+		settings: EngineCompactionSettings,
+		shape: snapcompact.Shape,
+	): number {
 		const ctxWindow = this.#model?.contextWindow ?? 0;
 		if (ctxWindow <= 0) {
 			return Math.min(
@@ -3461,7 +3471,6 @@ export class SessionMaintenance {
 		//   drift on denser content (e.g. dense JSON / tool-result blobs).
 		// - Summary template (intro + FILES section + grid notes) bills
 		//   ~2k tokens for typical sessions.
-		const shape = snapcompact.resolveShape(this.#model, this.#host.settings.get("snapcompact.shape"));
 		const edgeCap = snapcompact.geometry(shape).capacity;
 		const textEdgeTokens = Math.ceil((2 * edgeCap * 1.15) / 4);
 		const SUMMARY_TEMPLATE_TOKENS = 2000;
@@ -4505,7 +4514,7 @@ export class SessionMaintenance {
 					});
 					snapcompactBlocker = `snapcompact disabled: unsupported characters for selected snapcompact font (${percent}%); trying the next preferred compaction method.`;
 				} else {
-					const maxFrames = this.#computeSnapcompactMaxFrames(preparation, effectiveSettings);
+					const maxFrames = this.#computeSnapcompactMaxFrames(preparation, effectiveSettings, shape);
 					if (maxFrames < 1) {
 						logger.warn("Snapcompact skipped: kept history alone exceeds the context budget", {
 							model: this.#model?.id,
@@ -4513,51 +4522,33 @@ export class SessionMaintenance {
 						snapcompactBlocker =
 							"snapcompact: kept history alone exceeds the context budget; trying the next preferred compaction method.";
 					} else {
-						snapcompactResult = await snapcompact.compact(preparation, {
-							convertToLlm,
-							model: this.#model,
-							...(shapeSetting === "auto" ? {} : { shape }),
-							maxFrames,
-							includeThinking: snapcompactIncludeThinking,
-						});
-						const framePayloadBytes = this.#snapcompactFramePayloadBytes(snapcompactResult);
-						if (framePayloadBytes > snapcompact.FRAME_DATA_BYTES_BUDGET) {
-							logger.warn("Snapcompact exceeded the per-request frame payload budget", {
-								model: this.#model?.id,
-								framePayloadBytes,
-								budget: snapcompact.FRAME_DATA_BYTES_BUDGET,
-							});
-							snapcompactBlocker =
-								"snapcompact produced too much standing image payload; trying the next preferred compaction method.";
-							snapcompactResult = undefined;
-						}
-						if (snapcompactResult) {
-							const ctxWindow = this.#model?.contextWindow ?? 0;
-							const budget =
-								ctxWindow > 0
-									? ctxWindow - effectiveReserveTokens(ctxWindow, effectiveSettings)
-									: Number.POSITIVE_INFINITY;
-							const projected = this.#projectSnapcompactContextTokens(preparation, snapcompactResult);
-							// Reduction check in the encrypted-reasoning-excluded domain so opaque
-							// replay signatures cannot inflate the removable baseline (#10716);
-							// `triggerContextTokens` is already an encrypted-excluded stored
-							// estimate, and `#projectPreSnapcompactContextTokens` now matches it.
+						const ctxWindow = this.#model?.contextWindow ?? 0;
+						const budget =
+							ctxWindow > 0
+								? ctxWindow - effectiveReserveTokens(ctxWindow, effectiveSettings)
+								: Number.POSITIVE_INFINITY;
+						const reductionBaseline =
+							options.triggerContextTokens !== undefined
+								? Math.max(0, options.triggerContextTokens - (options.pendingContextTokens ?? 0))
+								: this.#projectPreSnapcompactContextTokens(preparation);
+						const preparedReductionBaseline =
+							options.preparedContextTokens === undefined
+								? reductionBaseline
+								: Math.max(0, reductionBaseline - options.preparedContextTokens) +
+									this.#projectPreSnapcompactContextTokens(preparation);
+						const projectionPreparation = preparation;
+						let projectionChecked = false;
+						let projectionRejected = false;
+						const validateProjection = (result: snapcompact.CompactionResult): void => {
+							projectionChecked = true;
+							const projected = this.#projectSnapcompactContextTokens(projectionPreparation, result);
 							const projectedForReduction = this.#projectSnapcompactContextTokens(
-								preparation,
-								snapcompactResult,
+								projectionPreparation,
+								result,
 								{
 									excludeEncryptedReasoning: true,
 								},
 							);
-							const reductionBaseline =
-								options.triggerContextTokens !== undefined
-									? Math.max(0, options.triggerContextTokens - (options.pendingContextTokens ?? 0))
-									: this.#projectPreSnapcompactContextTokens(preparation);
-							const preparedReductionBaseline =
-								options.preparedContextTokens === undefined
-									? reductionBaseline
-									: Math.max(0, reductionBaseline - options.preparedContextTokens) +
-										this.#projectPreSnapcompactContextTokens(preparation);
 							if (projectedForReduction >= preparedReductionBaseline) {
 								logger.warn("Snapcompact projection would not reduce context", {
 									model: this.#model?.id,
@@ -4566,8 +4557,10 @@ export class SessionMaintenance {
 								});
 								snapcompactBlocker =
 									"snapcompact would not reduce context; trying the next preferred compaction method.";
-								snapcompactResult = undefined;
-							} else if (projected > budget) {
+								projectionRejected = true;
+								throw new Error(snapcompactBlocker);
+							}
+							if (projected > budget) {
 								logger.warn("Snapcompact still overflows the window after frame-budget sizing", {
 									model: this.#model?.id,
 									projected,
@@ -4575,13 +4568,46 @@ export class SessionMaintenance {
 								});
 								snapcompactBlocker =
 									"snapcompact could not bring the context under the limit; trying the next preferred compaction method.";
+								projectionRejected = true;
+								throw new Error(snapcompactBlocker);
+							}
+						};
+						try {
+							snapcompactResult = await snapcompact.compact(preparation, {
+								convertToLlm,
+								model: this.#model,
+								shape,
+								maxFrames,
+								includeThinking: snapcompactIncludeThinking,
+								beforeRender: validateProjection,
+							});
+						} catch (error) {
+							if (!projectionRejected) throw error;
+						}
+						if (snapcompactResult) {
+							const framePayloadBytes = this.#snapcompactFramePayloadBytes(snapcompactResult);
+							if (framePayloadBytes > snapcompact.FRAME_DATA_BYTES_BUDGET) {
+								logger.warn("Snapcompact exceeded the per-request frame payload budget", {
+									model: this.#model?.id,
+									framePayloadBytes,
+									budget: snapcompact.FRAME_DATA_BYTES_BUDGET,
+								});
+								snapcompactBlocker =
+									"snapcompact produced too much standing image payload; trying the next preferred compaction method.";
+								snapcompactResult = undefined;
+							}
+						}
+						if (snapcompactResult && !projectionChecked) {
+							try {
+								validateProjection(snapcompactResult);
+							} catch (error) {
+								if (!projectionRejected) throw error;
 								snapcompactResult = undefined;
 							}
 						}
 					}
 				}
 				if (snapcompactBlocker) {
-					this.#host.emitNotice("warning", snapcompactBlocker, "compaction");
 					await this.#emitLifecycleEvent(
 						{
 							type: "auto_compaction_end",

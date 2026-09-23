@@ -1195,7 +1195,7 @@
 
 - Improved terminal readability on light backgrounds by ensuring TUI surfaces use contrasting foreground colors.
 - Coalesced simultaneous autonomous continuation requests to prevent repeated calls while the agent is busy, with clearer continuation diagnostics.
-- Fixed Snapcompact so it skips or falls back when compaction would not reduce context size, and now compacts text in mixed tool results while preserving all source images.
+- Fixed Snapcompact so it sizes frames from the resolved text-aware shape, exposes accurate pre-render frame metadata, skips or falls back before PNG rendering when compaction would not reduce context size, emits one fallback warning, and compacts text in mixed tool results while preserving all source images.
 - Added Google Antigravity daily quota usage to the status line.
 - Fixed status-line background-work counts so queued tasks and evaluation jobs remain visible without double-counting running subagents.
 - Fixed nested subagent visibility in RPC subscriptions, the subagent HUD, `get_subagents`, `subagent_*` events, and `get_subagent_messages`.

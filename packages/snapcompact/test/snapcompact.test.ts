@@ -886,6 +886,62 @@ describe("compact", () => {
 		expect(blocks[0]?.type).toBe("text");
 	});
 
+	it("allows rejecting planned frames before PNG rendering", async () => {
+		let preview: snapcompact.CompactionResult | undefined;
+		const compaction = snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [createUserMessage("Important history. ".repeat(5000))],
+			}),
+			{
+				frameSize: TEST_FRAME_SIZE,
+				maxFrames: 2,
+				beforeRender: result => {
+					preview = result;
+					throw new Error("skip render");
+				},
+			},
+		);
+
+		await expect(compaction).rejects.toThrow("skip render");
+		const archive = snapcompact.getPreservedArchive(preview?.preserveData);
+		expect(archive?.frames.length).toBeGreaterThan(0);
+		expect(archive?.frames.every(frame => frame.data === "AA==")).toBe(true);
+	});
+
+	it("reports final rendered character counts in the pre-render preview", async () => {
+		let preview: snapcompact.CompactionResult | undefined;
+		const result = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage("A".repeat(900)),
+					createToolResultMessage("FAIL ".repeat(20)),
+					createUserMessage("Z".repeat(900)),
+				],
+			}),
+			{
+				frameSize: TEST_FRAME_SIZE,
+				maxFrames: 2,
+				shape: snapcompact.resolveShape(undefined, "doc-8on16-bw"),
+				beforeRender: planned => {
+					preview = planned;
+				},
+			},
+		);
+
+		const previewArchive = snapcompact.getPreservedArchive(preview?.preserveData);
+		const renderedArchive = snapcompact.getPreservedArchive(result.preserveData);
+		if (!previewArchive?.text || !renderedArchive) throw new Error("Expected persisted archive text");
+		const imagedText = previewArchive.text.slice(
+			previewArchive.textHead?.length ?? 0,
+			previewArchive.text.length - (previewArchive.textTail?.length ?? 0),
+		);
+		expect(imagedText).toContain(snapcompact.DIM_ON);
+		expect(imagedText).toContain(snapcompact.DIM_OFF);
+		expect(previewArchive.frames.reduce((sum, frame) => sum + frame.chars, 0)).toBeLessThan(imagedText.length);
+		expect(renderedArchive.frames.length).toBe(previewArchive.frames.length);
+		expect(previewArchive.frames.map(frame => frame.chars)).toEqual(renderedArchive.frames.map(frame => frame.chars));
+	});
+
 	it("carries dim tool-output spans from text into the first image frame", async () => {
 		const result = await snapcompact.compact(
 			makePreparation({

@@ -16,6 +16,7 @@ interface Harness {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	notices: string[];
+	fallbackErrors: string[];
 	awaitCompactionEnd: () => Promise<{ action: string; errorMessage?: string }>;
 	triggerThreshold: () => void;
 }
@@ -67,8 +68,10 @@ async function createHarness(modelRegistry: ModelRegistry, options: HarnessOptio
 	});
 	const end = Promise.withResolvers<{ action: string; errorMessage?: string }>();
 	const notices: string[] = [];
+	const fallbackErrors: string[] = [];
 	session.subscribe(event => {
 		if (event.type === "notice" && event.source === "compaction") notices.push(event.message);
+		if (event.type === "auto_compaction_end" && event.errorMessage) fallbackErrors.push(event.errorMessage);
 		if (
 			event.type === "auto_compaction_end" &&
 			!event.aborted &&
@@ -110,7 +113,7 @@ async function createHarness(modelRegistry: ModelRegistry, options: HarnessOptio
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 	};
 
-	return { session, sessionManager, notices, awaitCompactionEnd: () => end.promise, triggerThreshold };
+	return { session, sessionManager, notices, fallbackErrors, awaitCompactionEnd: () => end.promise, triggerThreshold };
 }
 
 describe("AgentSession auto-snapcompact local-blocker fallback", () => {
@@ -212,10 +215,11 @@ describe("AgentSession auto-snapcompact local-blocker fallback", () => {
 		expect(result.action).toBe("context-full");
 		expect(result.errorMessage).toBeUndefined();
 		expect(compactionModule.compact).toHaveBeenCalled();
-		const unsupportedGlyphNotice = harness.notices.find(message =>
+		const unsupportedGlyphError = harness.fallbackErrors.find(message =>
 			message.startsWith("snapcompact disabled: unsupported characters for selected snapcompact font"),
 		);
-		expect(unsupportedGlyphNotice).toContain("trying the next preferred compaction method.");
+		expect(unsupportedGlyphError).toContain("trying the next preferred compaction method.");
+		expect(harness.notices).not.toContain(unsupportedGlyphError);
 		expect(harness.sessionManager.getBranch().find(entry => entry.type === "compaction")).toMatchObject({
 			type: "compaction",
 			summary: "compacted",

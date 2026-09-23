@@ -598,6 +598,8 @@ export interface Options<TMessage = Message> extends SerializeOptions {
 	frameSize?: number;
 	/** Upper limit on archive frames; clamped to (and defaulting to) {@link MAX_FRAMES_DEFAULT}. */
 	maxFrames?: number;
+	/** Inspect exact frame metadata before PNG rendering; throwing cancels the render. */
+	beforeRender?: (preview: CompactionResult) => void;
 }
 
 /** Result of rendering one frame. */
@@ -2178,89 +2180,95 @@ export async function compact<TMessage = Message>(
 	const layout = planArchive(archiveText, high, low, maxFrames);
 	truncatedChars += layout.truncatedChars;
 
-	// Re-render the planned frames, carrying any open dim span across every
-	// boundary: textHead → frames → textTail.
+	// Build exact metadata first so callers can reject layouts without paying the PNG cost.
 	let dimOpen = layout.textHead.lastIndexOf(DIM_ON) > layout.textHead.lastIndexOf(DIM_OFF);
-	const newFrames: Promise<Frame>[] = [];
-	for (const planned of layout.frames) {
-		let pageText: string = dimOpen ? DIM_ON + planned.text : planned.text;
-		dimOpen = pageText.lastIndexOf(DIM_ON) > pageText.lastIndexOf(DIM_OFF);
-		if (planned.shape.stopwordDim) pageText = dimStopwords(pageText);
-		newFrames.push(
-			render(pageText, planned.shape).then(rendered => ({
-				data: rendered.data,
-				mimeType: "image/png",
-				cols: rendered.cols,
-				rows: rendered.rows,
-				chars: rendered.chars,
-				font: planned.shape.font,
-				variant: planned.shape.variant,
-				lineRepeat: planned.shape.lineRepeat,
-				...(planned.shape.columns === 2 ? { columns: 2 } : {}),
-				...(planned.shape.stopwordDim ? { stopwordDim: true } : {}),
-				...(planned.shape.imageDetail ? { detail: planned.shape.imageDetail } : {}),
-			})),
-		);
-	}
+	const plannedFrames = layout.frames.map(planned => {
+		let text = dimOpen ? DIM_ON + planned.text : planned.text;
+		dimOpen = text.lastIndexOf(DIM_ON) > text.lastIndexOf(DIM_OFF);
+		if (planned.shape.stopwordDim) text = dimStopwords(text);
+		const frameGeometry = geometry(planned.shape);
+		const metadata: Frame = {
+			data: "AA==",
+			mimeType: "image/png",
+			cols: frameGeometry.cols,
+			rows: frameGeometry.rows,
+			chars: renderedChars(text, planned.shape, frameGeometry),
+			font: planned.shape.font,
+			variant: planned.shape.variant,
+			lineRepeat: planned.shape.lineRepeat,
+			...(planned.shape.columns === 2 ? { columns: 2 } : {}),
+			...(planned.shape.stopwordDim ? { stopwordDim: true } : {}),
+			...(planned.shape.imageDetail ? { detail: planned.shape.imageDetail } : {}),
+		};
+		return { text, shape: planned.shape, metadata };
+	});
 
 	const textHead = layout.textHead;
 	const textTail = layout.textTail.length > 0 ? (dimOpen ? DIM_ON : "") + layout.textTail : "";
 	const textChars = textHead.length + textTail.length;
-
-	const frames = await Promise.all(newFrames);
-	const totalChars = frames.reduce((sum, frame) => sum + frame.chars, 0) + textChars;
-	const frameCols: number[] = [];
-	for (const frame of frames) {
-		if (!frameCols.includes(frame.cols)) frameCols.push(frame.cols);
-	}
-	const summaryCols = frameCols.length > 0 ? frameCols.join(" or ") : geo.cols;
-
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	const files = formatFileList(readFiles, modifiedFiles, fileOps.read);
-
-	let summary: string;
-	if (frames.length === 0 && textHead.length === 0 && textTail.length === 0 && files.length === 0) {
-		summary = "No prior history.";
-	} else {
-		summary = prompt.render(snapcompactSummaryPrompt, {
-			frameCount: frames.length,
-			multipleFrames: frames.length > 1,
-			docColumns: high.columns === 2,
-			cols: summaryCols,
-			rows: geo.rows,
-			sentenceInk: high.variant === "sent",
-			stopwordDimmed: high.stopwordDim === true,
-			lineRepeated: high.lineRepeat > 1,
-			truncatedChars,
-			includedPreviousSummary,
-			files: files.length > 0 ? files : undefined,
-		});
-	}
-
-	// A snapcompact pass replaces any provider-side compaction payload; strip the
-	// OpenAI replacement history and the Anthropic compaction block like the
-	// default summarizer path does.
 	const basePreserve = stripProviderCompactionPreserveData(previousPreserveData) ?? {};
 	const persistedText =
 		layout.keptText.length > 0 && layout.textTail.length > 0
 			? `${layout.keptText.slice(0, layout.keptText.length - layout.textTail.length)}${textTail}`
 			: layout.keptText;
-	const archive: Archive = {
-		frames,
-		totalChars,
-		truncatedChars,
-		...(persistedText.length > 0 ? { text: persistedText } : {}),
-		...(textHead ? { textHead } : {}),
-		...(textTail ? { textTail } : {}),
+
+	const buildResult = (frames: Frame[]): CompactionResult => {
+		const totalChars = frames.reduce((sum, frame) => sum + frame.chars, 0) + textChars;
+		const frameCols: number[] = [];
+		for (const frame of frames) {
+			if (!frameCols.includes(frame.cols)) frameCols.push(frame.cols);
+		}
+		const summaryCols = frameCols.length > 0 ? frameCols.join(" or ") : geo.cols;
+		const summary =
+			frames.length === 0 && textHead.length === 0 && textTail.length === 0 && files.length === 0
+				? "No prior history."
+				: prompt.render(snapcompactSummaryPrompt, {
+						frameCount: frames.length,
+						multipleFrames: frames.length > 1,
+						docColumns: high.columns === 2,
+						cols: summaryCols,
+						rows: geo.rows,
+						sentenceInk: high.variant === "sent",
+						stopwordDimmed: high.stopwordDim === true,
+						lineRepeated: high.lineRepeat > 1,
+						truncatedChars,
+						includedPreviousSummary,
+						files: files.length > 0 ? files : undefined,
+					});
+		const archive: Archive = {
+			frames,
+			totalChars,
+			truncatedChars,
+			...(persistedText.length > 0 ? { text: persistedText } : {}),
+			...(textHead ? { textHead } : {}),
+			...(textTail ? { textTail } : {}),
+		};
+		const textNote = textChars > 0 ? ` (+${textChars.toLocaleString()} chars as text)` : "";
+		return {
+			summary,
+			shortSummary: `Archived ${totalChars.toLocaleString()} chars of history onto ${frames.length} snapcompact frame${frames.length === 1 ? "" : "s"}${textNote}`,
+			firstKeptEntryId,
+			tokensBefore,
+			details: { readFiles, modifiedFiles },
+			preserveData: { ...basePreserve, [PRESERVE_KEY]: archive },
+		};
 	};
 
-	const textNote = textChars > 0 ? ` (+${textChars.toLocaleString()} chars as text)` : "";
-	return {
-		summary,
-		shortSummary: `Archived ${totalChars.toLocaleString()} chars of history onto ${frames.length} snapcompact frame${frames.length === 1 ? "" : "s"}${textNote}`,
-		firstKeptEntryId,
-		tokensBefore,
-		details: { readFiles, modifiedFiles },
-		preserveData: { ...basePreserve, [PRESERVE_KEY]: archive },
-	};
+	options?.beforeRender?.(buildResult(plannedFrames.map(frame => frame.metadata)));
+
+	const frames = await Promise.all(
+		plannedFrames.map(async planned => {
+			const rendered = await render(planned.text, planned.shape);
+			return {
+				...planned.metadata,
+				data: rendered.data,
+				cols: rendered.cols,
+				rows: rendered.rows,
+				chars: rendered.chars,
+			};
+		}),
+	);
+	return buildResult(frames);
 }
