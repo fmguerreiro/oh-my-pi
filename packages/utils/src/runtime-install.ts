@@ -416,6 +416,9 @@ async function readPipe(stream: ReadableStream<Uint8Array> | null): Promise<stri
 	return new Response(stream).text();
 }
 
+const RUNTIME_INSTALL_TIMEOUT_MS = 8 * 60_000;
+const RUNTIME_INSTALL_TIMED_OUT = Symbol("runtime-install.timedOut");
+
 async function runRuntimeInstall(runtimeDir: string): Promise<void> {
 	// `process.execPath` is plain bun in source/bundle mode and the compiled
 	// binary otherwise; BUN_BE_BUN makes the compiled binary act as bun.
@@ -424,15 +427,35 @@ async function runRuntimeInstall(runtimeDir: string): Promise<void> {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const [stdout, stderr, exitCode] = await Promise.all([
+	const output = Promise.all([
 		readPipe(proc.stdout as ReadableStream<Uint8Array> | null),
 		readPipe(proc.stderr as ReadableStream<Uint8Array> | null),
-		proc.exited,
 	]);
+	const { promise: timedOut, resolve: timeout } = Promise.withResolvers<typeof RUNTIME_INSTALL_TIMED_OUT>();
+	const timer = setTimeout(() => timeout(RUNTIME_INSTALL_TIMED_OUT), RUNTIME_INSTALL_TIMEOUT_MS);
+	timer.unref();
+	let exitCode: number;
+	try {
+		const result = await Promise.race([proc.exited, timedOut]);
+		if (result === RUNTIME_INSTALL_TIMED_OUT) {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// Already gone.
+			}
+			await proc.exited;
+			await output;
+			throw new Error(`Runtime install at ${runtimeDir} timed out after ${RUNTIME_INSTALL_TIMEOUT_MS}ms`);
+		}
+		exitCode = result;
+	} finally {
+		clearTimeout(timer);
+	}
+	const [stdout, stderr] = await output;
 	if (exitCode === 0) return;
-	const output = `${stdout}\n${stderr}`.trim();
+	const text = `${stdout}\n${stderr}`.trim();
 	throw new Error(
-		`Failed to install runtime at ${runtimeDir} with ${process.execPath} install (exit ${exitCode}): ${output}`,
+		`Failed to install runtime at ${runtimeDir} with ${process.execPath} install (exit ${exitCode}): ${text}`,
 	);
 }
 

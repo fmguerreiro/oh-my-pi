@@ -112,16 +112,14 @@ export interface MnemopiSubprocessEmbeddingModel {
 }
 
 /**
- * Upper bound on a steady-state embed IPC round-trip. Initialization is
- * intentionally exempt: bundled installs may spend several minutes installing
- * fastembed and bootstrapping the model, and killing that worker can strand the
- * runtime install lock. Once initialization succeeds, a longer embed stall
- * means a hung native runtime (issue #4792) that would otherwise pin whatever
- * awaits the embed — a turn's memory recall or the headless shutdown
- * consolidation — indefinitely, leaving the process alive with an unreaped
- * `__omp_worker_mnemopi_embed` child (issue #7352). On expiry the embed fails
- * and the worker is SIGKILL-reaped so the next request respawns a fresh one.
+ * Upper bounds for local embedding IPC. Initialization gets a separate,
+ * generous deadline because bundled installs may spend several minutes
+ * installing fastembed and bootstrapping a model. A timeout still reaps the
+ * worker so a stalled runtime install cannot pin a session forever. Once
+ * initialization succeeds, a shorter embed deadline catches hung native
+ * runtimes (issue #7352).
  */
+const EMBED_INITIALIZATION_TIMEOUT_MS = 10 * 60_000;
 const EMBED_REQUEST_TIMEOUT_MS = 120_000;
 
 /** Race marker for {@link MnemopiEmbedClient.#awaitRequest}. */
@@ -136,13 +134,16 @@ export class MnemopiEmbedClient {
 	#refed = false;
 	#spawnWorker: () => MnemopiEmbedWorkerHandle;
 	#requestTimeoutMs: number;
+	#initializationTimeoutMs: number;
 
 	constructor(
 		spawnWorker: () => MnemopiEmbedWorkerHandle = spawnMnemopiEmbedWorker,
 		requestTimeoutMs: number = EMBED_REQUEST_TIMEOUT_MS,
+		initializationTimeoutMs: number = EMBED_INITIALIZATION_TIMEOUT_MS,
 	) {
 		this.#spawnWorker = spawnWorker;
 		this.#requestTimeoutMs = requestTimeoutMs;
+		this.#initializationTimeoutMs = initializationTimeoutMs;
 	}
 
 	/**
@@ -171,7 +172,7 @@ export class MnemopiEmbedClient {
 			this.#addPending(id, { kind: "init", model, resolve });
 			try {
 				worker.send({ type: "init", id, model, cacheDir });
-				const error = await promise;
+				const error = await this.#awaitInitialization(promise);
 				if (error !== undefined) {
 					tracker?.fail(error);
 					return null;
@@ -233,6 +234,22 @@ export class MnemopiEmbedClient {
 			return result;
 		} finally {
 			this.#deletePending(id);
+		}
+	}
+
+	async #awaitInitialization(promise: Promise<string | undefined>): Promise<string | undefined> {
+		const { promise: timedOut, resolve: fire } = Promise.withResolvers<typeof REQUEST_TIMED_OUT>();
+		const timer = setTimeout(() => fire(REQUEST_TIMED_OUT), this.#initializationTimeoutMs);
+		timer.unref();
+		try {
+			const winner = await Promise.race([promise, timedOut]);
+			if (winner === REQUEST_TIMED_OUT) {
+				await this.terminate();
+				throw new Error("mnemopi embed worker initialization timed out");
+			}
+			return winner;
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 

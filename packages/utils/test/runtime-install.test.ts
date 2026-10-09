@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as Module from "node:module";
@@ -23,6 +23,8 @@ const tempDirs: string[] = [];
 const resolverUninstalls: Array<() => void> = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
+	vi.useRealTimers();
 	// Restore the process-wide module resolver first: a leaked patch breaks
 	// `createRequire` relative requires for every later test file (Bun invokes
 	// a JS `_resolveFilename` override with `parent === undefined`).
@@ -459,5 +461,57 @@ describe("ensureRuntimeInstalled install lock", () => {
 				await holder.exited;
 			}
 		}
+	}, 20_000);
+
+	test("kills a timed-out installer, releases its lock, and permits a retry", async () => {
+		vi.useFakeTimers();
+		const { spec, probe } = await makeFileDependency();
+		const runtimeDir = await makeRuntimeDir();
+		const { promise: spawned, resolve: markSpawned } = Promise.withResolvers<void>();
+		const { promise: firstExit, resolve: exitFirst } = Promise.withResolvers<number>();
+		const kill = vi.fn(() => exitFirst(137));
+		const emptyPipe = () =>
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.close();
+				},
+			});
+		let installs = 0;
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			installs += 1;
+			if (installs === 1) {
+				markSpawned();
+				return { stdout: emptyPipe(), stderr: emptyPipe(), exited: firstExit, kill } as never;
+			}
+			return {
+				stdout: emptyPipe(),
+				stderr: emptyPipe(),
+				exited: (async () => {
+					const manifest = path.join(runtimeDir, "node_modules", ...probe.split("/"), "package.json");
+					await fs.mkdir(path.dirname(manifest), { recursive: true });
+					await fs.writeFile(manifest, JSON.stringify({ name: probe, version: "1.0.0" }));
+					return 0;
+				})(),
+				kill: vi.fn(),
+			} as never;
+		});
+
+		const first = ensureRuntimeInstalled({
+			runtimeDir,
+			install: { dependencies: { [probe]: spec } },
+			probePackage: probe,
+		});
+		await spawned;
+		vi.advanceTimersByTime(8 * 60_000);
+		await expect(first).rejects.toThrow(/Runtime install .* timed out after 480000ms/);
+		expect(kill).toHaveBeenCalledWith("SIGKILL");
+
+		await ensureRuntimeInstalled({
+			runtimeDir,
+			install: { dependencies: { [probe]: spec } },
+			probePackage: probe,
+		});
+		expect(installs).toBe(2);
+		expect(await Bun.file(path.join(runtimeDir, "node_modules", probe, "package.json")).exists()).toBe(true);
 	}, 20_000);
 });

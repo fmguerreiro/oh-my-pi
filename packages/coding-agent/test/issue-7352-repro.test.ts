@@ -10,11 +10,6 @@
  * bounded the dispose-time consolidate *await*; the embed IPC underneath it
  * stayed unbounded, so the wedge escaped that budget.
  *
- * The fix bounds steady-state embed requests: on expiry the request fails and
- * the wedged worker is SIGKILL-reaped so the next call respawns a fresh child.
- * Initialization stays unbounded because first use may install fastembed and
- * bootstrap the model. These tests use fake workers so the contract is
- * exercised without fastembed/onnxruntime.
  */
 import { describe, expect, it, vi } from "bun:test";
 import { MnemopiEmbedClient, type MnemopiEmbedWorkerHandle } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-client";
@@ -115,7 +110,72 @@ describe("issue #7352 — mnemopi embed requests are bounded and reap a wedged w
 		}
 	}, 10_000);
 
-	it("allows initialization to outlive the steady-state embed budget", async () => {
+	it("returns unavailable after an init timeout, reaps the worker, and respawns", async () => {
+		vi.useFakeTimers();
+		const state = { spawns: 0, terminated: 0 };
+		const { promise: initStarted, resolve: markInitStarted } = Promise.withResolvers<void>();
+		const { promise: terminating, resolve: markTerminating } = Promise.withResolvers<void>();
+		const { promise: reaped, resolve: markReaped } = Promise.withResolvers<void>();
+		const client = new MnemopiEmbedClient(() => {
+			const spawn = ++state.spawns;
+			let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
+			return {
+				send(message) {
+					if (message.type !== "init") return;
+					if (spawn === 1) {
+						markInitStarted();
+						return;
+					}
+					queueMicrotask(() => handler?.({ type: "ready", id: message.id }));
+				},
+				onMessage(next) {
+					handler = next;
+					return () => {
+						if (handler === next) handler = undefined;
+					};
+				},
+				onError() {
+					return () => {};
+				},
+				ref() {},
+				unref() {},
+				async terminate() {
+					state.terminated += 1;
+					if (spawn === 1) {
+						markTerminating();
+						await reaped;
+					}
+					handler = undefined;
+				},
+			};
+		}, 50, 50);
+		try {
+			const first = client.initialize("fast-bge-base-en-v1.5", undefined);
+			await initStarted;
+			vi.advanceTimersByTime(50);
+			await Promise.resolve();
+			await Promise.resolve();
+			await terminating;
+			expect(state.terminated).toBe(1);
+
+			let settled = false;
+			void first.then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			markReaped();
+			expect(await first).toBeNull();
+			expect(await client.initialize("fast-bge-base-en-v1.5", undefined)).not.toBeNull();
+			expect(state.spawns).toBe(2);
+		} finally {
+			await client.terminate();
+			vi.useRealTimers();
+		}
+	}, 10_000);
+
+	it("allows initialization to outlive the steady-state embed budget within its own deadline", async () => {
 		vi.useFakeTimers();
 		const state = { spawns: 0, terminated: 0 };
 		const { promise: initStarted, resolve: markInitStarted } = Promise.withResolvers<void>();
@@ -145,7 +205,7 @@ describe("issue #7352 — mnemopi embed requests are bounded and reap a wedged w
 					handler = undefined;
 				},
 			};
-		}, 50);
+		}, 50, 20_000);
 		try {
 			const initializing = client.initialize("fast-bge-base-en-v1.5", undefined);
 			await initStarted;
