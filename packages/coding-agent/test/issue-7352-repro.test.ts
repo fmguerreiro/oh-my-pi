@@ -116,39 +116,43 @@ describe("issue #7352 — mnemopi embed requests are bounded and reap a wedged w
 		const { promise: initStarted, resolve: markInitStarted } = Promise.withResolvers<void>();
 		const { promise: terminating, resolve: markTerminating } = Promise.withResolvers<void>();
 		const { promise: reaped, resolve: markReaped } = Promise.withResolvers<void>();
-		const client = new MnemopiEmbedClient(() => {
-			const spawn = ++state.spawns;
-			let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
-			return {
-				send(message) {
-					if (message.type !== "init") return;
-					if (spawn === 1) {
-						markInitStarted();
-						return;
-					}
-					queueMicrotask(() => handler?.({ type: "ready", id: message.id }));
-				},
-				onMessage(next) {
-					handler = next;
-					return () => {
-						if (handler === next) handler = undefined;
-					};
-				},
-				onError() {
-					return () => {};
-				},
-				ref() {},
-				unref() {},
-				async terminate() {
-					state.terminated += 1;
-					if (spawn === 1) {
-						markTerminating();
-						await reaped;
-					}
-					handler = undefined;
-				},
-			};
-		}, 50, 50);
+		const client = new MnemopiEmbedClient(
+			() => {
+				const spawn = ++state.spawns;
+				let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
+				return {
+					send(message) {
+						if (message.type !== "init") return;
+						if (spawn === 1) {
+							markInitStarted();
+							return;
+						}
+						queueMicrotask(() => handler?.({ type: "ready", id: message.id }));
+					},
+					onMessage(next) {
+						handler = next;
+						return () => {
+							if (handler === next) handler = undefined;
+						};
+					},
+					onError() {
+						return () => {};
+					},
+					ref() {},
+					unref() {},
+					async terminate() {
+						state.terminated += 1;
+						if (spawn === 1) {
+							markTerminating();
+							await reaped;
+						}
+						handler = undefined;
+					},
+				};
+			},
+			50,
+			50,
+		);
 		try {
 			const first = client.initialize("fast-bge-base-en-v1.5", undefined);
 			await initStarted;
@@ -175,37 +179,93 @@ describe("issue #7352 — mnemopi embed requests are bounded and reap a wedged w
 		}
 	}, 10_000);
 
+	it("does not cancel another model's in-flight embed when initialization times out", async () => {
+		vi.useFakeTimers();
+		const terminated: string[] = [];
+		const { promise: embedStarted, resolve: markEmbedStarted } = Promise.withResolvers<void>();
+		let finishEmbed: (() => void) | undefined;
+		const client = new MnemopiEmbedClient(
+			model => {
+				let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
+				return {
+					send(message) {
+						if (message.type === "init" && model === "fast-ready") {
+							queueMicrotask(() => handler?.({ type: "ready", id: message.id }));
+						} else if (message.type === "embed") {
+							finishEmbed = () => handler?.({ type: "vectors", id: message.id, vectors: [[1, 2]] });
+							markEmbedStarted();
+						}
+					},
+					onMessage(next) {
+						handler = next;
+						return () => {
+							if (handler === next) handler = undefined;
+						};
+					},
+					onError() {
+						return () => {};
+					},
+					ref() {},
+					unref() {},
+					async terminate() {
+						terminated.push(model);
+					},
+				};
+			},
+			1_000,
+			50,
+		);
+		try {
+			const stalled = client.load("fast-stalled", undefined);
+			expect(await client.load("fast-ready", undefined)).toBeUndefined();
+			const embedding = client.embed("fast-ready", undefined, ["hello"], undefined);
+			await embedStarted;
+			vi.advanceTimersByTime(50);
+			expect(await stalled).toMatch(/timed out/i);
+			expect(terminated).toEqual(["fast-stalled"]);
+			finishEmbed?.();
+			expect(await embedding).toEqual([[1, 2]]);
+		} finally {
+			await client.terminate();
+			vi.useRealTimers();
+		}
+	}, 10_000);
+
 	it("allows initialization to outlive the steady-state embed budget within its own deadline", async () => {
 		vi.useFakeTimers();
 		const state = { spawns: 0, terminated: 0 };
 		const { promise: initStarted, resolve: markInitStarted } = Promise.withResolvers<void>();
 		let completeInit: (() => void) | undefined;
-		const client = new MnemopiEmbedClient(() => {
-			state.spawns += 1;
-			let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
-			return {
-				send(message) {
-					if (message.type !== "init") return;
-					completeInit = () => handler?.({ type: "ready", id: message.id });
-					markInitStarted();
-				},
-				onMessage(next) {
-					handler = next;
-					return () => {
-						if (handler === next) handler = undefined;
-					};
-				},
-				onError() {
-					return () => {};
-				},
-				ref() {},
-				unref() {},
-				async terminate() {
-					state.terminated += 1;
-					handler = undefined;
-				},
-			};
-		}, 50, 20_000);
+		const client = new MnemopiEmbedClient(
+			() => {
+				state.spawns += 1;
+				let handler: ((message: MnemopiEmbedWorkerOutbound) => void) | undefined;
+				return {
+					send(message) {
+						if (message.type !== "init") return;
+						completeInit = () => handler?.({ type: "ready", id: message.id });
+						markInitStarted();
+					},
+					onMessage(next) {
+						handler = next;
+						return () => {
+							if (handler === next) handler = undefined;
+						};
+					},
+					onError() {
+						return () => {};
+					},
+					ref() {},
+					unref() {},
+					async terminate() {
+						state.terminated += 1;
+						handler = undefined;
+					},
+				};
+			},
+			50,
+			20_000,
+		);
 		try {
 			const initializing = client.initialize("fast-bge-base-en-v1.5", undefined);
 			await initStarted;
