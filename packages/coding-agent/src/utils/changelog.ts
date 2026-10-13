@@ -135,7 +135,7 @@ function formatCategoryBreakdown(categoryCounts: Record<string, number>): string
 			.sort(),
 	];
 	return orderedCategories
-		.map(category => `${categoryCounts[category]} ${categoryLabel(category, categoryCounts[category])}`)
+		.map(category => `${categoryCounts[category]} ${sanitizeText(categoryLabel(category, categoryCounts[category]))}`)
 		.join(" · ");
 }
 
@@ -267,7 +267,9 @@ export async function fetchAvailableReleaseNotes(
 
 		const lines: string[] = [];
 		const bulletLimit = mode === "expanded" ? 5 : 2;
-		for (const entry of entries.reverse()) {
+		const omittedReleases = entries.length - RECENT_CHANGELOG_ENTRY_LIMIT;
+		if (omittedReleases > 0) lines.push(`+${omittedReleases} earlier ${omittedReleases === 1 ? "release" : "releases"}`);
+		for (const entry of entries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT).reverse()) {
 			const version = `${entry.major}.${entry.minor}.${entry.patch}`;
 			const { changeCount, categoryCounts } = summarizeChangelogEntries([entry]);
 			if (changeCount === 0) return undefined;
