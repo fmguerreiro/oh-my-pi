@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Startup update notices now show a summary of every newer coding-agent release and link to their changes.
+
 ## [18.10.1] - 2026-10-12
 
 ### Added

@@ -1158,7 +1158,7 @@ export class UiHelpers {
 		this.ctx.present(options?.hideWithToolActivity ? new ToolActivityContainer(content) : content);
 	}
 
-	showNewVersionNotification(newVersion: string): void {
+	showNewVersionNotification(newVersion: string, notes?: string): void {
 		const block = new TranscriptBlock();
 		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));
 		const title = "Update Available";
@@ -1170,6 +1170,7 @@ export class UiHelpers {
 					`${theme.bold(theme.fg("warning", title))}\n${theme.fg("muted", prefix)}${theme.fg("accent", command)}`,
 			),
 		);
+		if (notes) block.addChild(new Text(`\n${notes}`, 1, 0));
 		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));
 		this.ctx.present(block);
 	}
