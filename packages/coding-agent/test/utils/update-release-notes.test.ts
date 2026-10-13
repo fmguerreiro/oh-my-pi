@@ -52,9 +52,49 @@ describe("available coding-agent release notes", () => {
 		expect(summary).toContain("https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.3");
 	});
 
+	test("skips an empty middle release without hiding its neighbours", async () => {
+		const response = `## [18.10.4]\n\n### Fixed\n\n- Fourth.\n\n## [18.10.3]\n\n### Changed\n\n${changelog.slice(changelog.indexOf("## [18.10.2]"))}`;
+		const notes = await fetchAvailableReleaseNotes(
+			"18.10.1",
+			"18.10.4",
+			"summary",
+			async () => new Response(response),
+		);
+		expect(notes?.split("\n")).toEqual([
+			"v18.10.2 · 1 changed",
+			"  • Second release change.",
+			"v18.10.4 · 1 fixed",
+			"  • Fourth.",
+			"Changes: https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.4",
+		]);
+	});
+
+	test("shows earlier changes when advertised release has no bullets", async () => {
+		const response = `## [18.10.4]\n\n### Changed\n\n${changelog.slice(changelog.indexOf("## [18.10.3]"))}`;
+		const notes = await fetchAvailableReleaseNotes(
+			"18.10.1",
+			"18.10.4",
+			"summary",
+			async () => new Response(response),
+		);
+		expect(notes?.split("\n")).toEqual([
+			"v18.10.2 · 1 changed",
+			"  • Second release change.",
+			"v18.10.3 · 3 added · 1 fixed",
+			"  • Third release feature.",
+			"  • Another third release feature.",
+			"Changes: https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.4",
+		]);
+	});
+
 	test("long update ranges show the newest three releases oldest-first, count the rest, and keep the full compare link", async () => {
 		const response = `## [18.10.5]\n\n### Fixed\n\n- Fifth.\n\n## [18.10.4]\n\n### Fixed\n\n- Fourth.\n\n${changelog.slice(changelog.indexOf("## [18.10.3]"))}`;
-		const notes = await fetchAvailableReleaseNotes("18.10.1", "18.10.5", "summary", async () => new Response(response));
+		const notes = await fetchAvailableReleaseNotes(
+			"18.10.1",
+			"18.10.5",
+			"summary",
+			async () => new Response(response),
+		);
 		expect(notes?.split("\n")).toEqual([
 			"+1 earlier release",
 			"v18.10.3 · 3 added · 1 fixed",
@@ -68,9 +108,35 @@ describe("available coding-agent release notes", () => {
 		]);
 	});
 
+	test("empty releases use no slots and do not count as earlier releases", async () => {
+		const response = `## [18.10.6]\n\n### Fixed\n\n- Sixth.\n\n## [18.10.5]\n\n### Changed\n\n## [18.10.4]\n\n### Fixed\n\n- Fourth.\n\n${changelog.slice(changelog.indexOf("## [18.10.3]"))}`;
+		const notes = await fetchAvailableReleaseNotes(
+			"18.10.1",
+			"18.10.6",
+			"summary",
+			async () => new Response(response),
+		);
+		expect(notes?.split("\n")).toEqual([
+			"+1 earlier release",
+			"v18.10.3 · 3 added · 1 fixed",
+			"  • Third release feature.",
+			"  • Another third release feature.",
+			"v18.10.4 · 1 fixed",
+			"  • Fourth.",
+			"v18.10.6 · 1 fixed",
+			"  • Sixth.",
+			"Changes: https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.6",
+		]);
+	});
+
 	test("strips terminal control sequences from remote category headings", async () => {
 		const response = "## [18.10.2]\n\n### Fixed\u001b[2J\u0007\n\n- Safe fix.\n";
-		const notes = await fetchAvailableReleaseNotes("18.10.1", "18.10.2", "summary", async () => new Response(response));
+		const notes = await fetchAvailableReleaseNotes(
+			"18.10.1",
+			"18.10.2",
+			"summary",
+			async () => new Response(response),
+		);
 		expect(notes).toContain("v18.10.2 · 1 fixed\n");
 		expect(notes).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
 	});
@@ -109,13 +175,12 @@ describe("available coding-agent release notes", () => {
 				async () => new Response("## [18.10.2]\n- Older only"),
 			),
 		).toBeUndefined();
+	});
+
+	test("returns no notes when every release in range has no bullets", async () => {
+		const response = "## [18.10.3]\n\n### Changed\n\n## [18.10.2]\nNo release bullets";
 		expect(
-			await fetchAvailableReleaseNotes(
-				"18.10.1",
-				"18.10.3",
-				"summary",
-				async () => new Response("## [18.10.3]\nNo release bullets"),
-			),
+			await fetchAvailableReleaseNotes("18.10.1", "18.10.3", "summary", async () => new Response(response)),
 		).toBeUndefined();
 	});
 

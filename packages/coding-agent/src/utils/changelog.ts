@@ -265,14 +265,20 @@ export async function fetchAvailableReleaseNotes(
 		);
 		if (!entries.some(entry => `${entry.major}.${entry.minor}.${entry.patch}` === latestVersion)) return undefined;
 
+		const releasesWithChanges: { entry: ChangelogEntry; categoryCounts: Record<string, number> }[] = [];
+		for (const entry of entries) {
+			const { changeCount, categoryCounts } = summarizeChangelogEntries([entry]);
+			if (changeCount > 0) releasesWithChanges.push({ entry, categoryCounts });
+		}
+		if (releasesWithChanges.length === 0) return undefined;
+
 		const lines: string[] = [];
 		const bulletLimit = mode === "expanded" ? 5 : 2;
-		const omittedReleases = entries.length - RECENT_CHANGELOG_ENTRY_LIMIT;
-		if (omittedReleases > 0) lines.push(`+${omittedReleases} earlier ${omittedReleases === 1 ? "release" : "releases"}`);
-		for (const entry of entries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT).reverse()) {
+		const omittedReleases = releasesWithChanges.length - RECENT_CHANGELOG_ENTRY_LIMIT;
+		if (omittedReleases > 0)
+			lines.push(`+${omittedReleases} earlier ${omittedReleases === 1 ? "release" : "releases"}`);
+		for (const { entry, categoryCounts } of releasesWithChanges.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT).reverse()) {
 			const version = `${entry.major}.${entry.minor}.${entry.patch}`;
-			const { changeCount, categoryCounts } = summarizeChangelogEntries([entry]);
-			if (changeCount === 0) return undefined;
 			lines.push(`v${version} · ${formatCategoryBreakdown(categoryCounts)}`);
 			let shown = 0;
 			for (const token of Lexer.lex(entry.content)) {
