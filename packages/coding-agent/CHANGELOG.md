@@ -6,6 +6,10 @@
 
 - Startup update notices now show a summary of every newer coding-agent release and link to their changes.
 
+### Fixed
+
+- Startup update notices keep showing available release notes when some newer releases have no listed changes.
+
 ## [18.10.1] - 2026-10-12
 
 ### Added
