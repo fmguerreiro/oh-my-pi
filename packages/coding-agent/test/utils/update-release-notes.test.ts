@@ -52,6 +52,29 @@ describe("available coding-agent release notes", () => {
 		expect(summary).toContain("https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.3");
 	});
 
+	test("long update ranges show the newest three releases oldest-first, count the rest, and keep the full compare link", async () => {
+		const response = `## [18.10.5]\n\n### Fixed\n\n- Fifth.\n\n## [18.10.4]\n\n### Fixed\n\n- Fourth.\n\n${changelog.slice(changelog.indexOf("## [18.10.3]"))}`;
+		const notes = await fetchAvailableReleaseNotes("18.10.1", "18.10.5", "summary", async () => new Response(response));
+		expect(notes?.split("\n")).toEqual([
+			"+1 earlier release",
+			"v18.10.3 · 3 added · 1 fixed",
+			"  • Third release feature.",
+			"  • Another third release feature.",
+			"v18.10.4 · 1 fixed",
+			"  • Fourth.",
+			"v18.10.5 · 1 fixed",
+			"  • Fifth.",
+			"Changes: https://github.com/can1357/oh-my-pi/compare/v18.10.1...v18.10.5",
+		]);
+	});
+
+	test("strips terminal control sequences from remote category headings", async () => {
+		const response = "## [18.10.2]\n\n### Fixed\u001b[2J\u0007\n\n- Safe fix.\n";
+		const notes = await fetchAvailableReleaseNotes("18.10.1", "18.10.2", "summary", async () => new Response(response));
+		expect(notes).toContain("v18.10.2 · 1 fixed\n");
+		expect(notes).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+	});
+
 	test("expanded mode shows more bullets, without including another package's section", async () => {
 		const response = `${changelog}\n## @oh-my-pi/pi-ai\n\n### Fixed\n\n- Other package fix.\n`;
 		const notes = await fetchAvailableReleaseNotes(
