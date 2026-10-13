@@ -1,11 +1,14 @@
 import * as path from "node:path";
-import { getLastChangelogVersionPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { Lexer } from "@oh-my-pi/pi-utils/marked";
 import type { BunFile } from "bun";
+import { previewLine, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
+import { getLastChangelogVersionPath, isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { Lexer } from "@oh-my-pi/pi-utils/marked";
 import bundledChangelogPath from "../../CHANGELOG.md" with { type: "file" };
+import type { Fetch } from "../cli/build-service";
 import type { SettingValueOf } from "../config/registry";
 
 import type { cfgStartupChangelogMode } from "../modes/settings";
+import { withTimeoutSignal } from "./fetch-timeout";
 
 export interface ChangelogEntry {
 	major: number;
@@ -124,6 +127,18 @@ function summarizeChangelogEntries(entries: readonly ChangelogEntry[]): {
 	return { changeCount, categoryCounts };
 }
 
+function formatCategoryBreakdown(categoryCounts: Record<string, number>): string {
+	const orderedCategories = [
+		...CHANGELOG_CATEGORY_ORDER.filter(category => categoryCounts[category]),
+		...Object.keys(categoryCounts)
+			.filter(category => !(CHANGELOG_CATEGORY_ORDER as readonly string[]).includes(category))
+			.sort(),
+	];
+	return orderedCategories
+		.map(category => `${categoryCounts[category]} ${categoryLabel(category, categoryCounts[category])}`)
+		.join(" · ");
+}
+
 function categoryLabel(category: string, count: number): string {
 	if (category === "Breaking Changes") {
 		return count === 1 ? "breaking change" : "breaking changes";
@@ -147,18 +162,7 @@ export function formatStartupChangelogSummary(selection: StartupChangelogSelecti
 			? `Updated to v${latestVersion} · ${changeCount} ${changeWord} in 1 release`
 			: `Updated to v${latestVersion} · ${changeCount} ${changeWord} across ${releaseCount} ${releaseWord}`;
 
-	const orderedCategories = [
-		...CHANGELOG_CATEGORY_ORDER.filter(category => selection.categoryCounts[category]),
-		...Object.keys(selection.categoryCounts)
-			.filter(category => !(CHANGELOG_CATEGORY_ORDER as readonly string[]).includes(category))
-			.sort(),
-	];
-	const breakdown = orderedCategories
-		.map(
-			category =>
-				`${selection.categoryCounts[category]} ${categoryLabel(category, selection.categoryCounts[category])}`,
-		)
-		.join(" · ");
+	const breakdown = formatCategoryBreakdown(selection.categoryCounts);
 	const omittedReleases = selection.totalUnseenEntries - selection.selectedEntries;
 	const detailHint =
 		omittedReleases > 0
@@ -196,7 +200,7 @@ export async function parseChangelog(changelogPath: string | undefined): Promise
 	return parseChangelogContent(content);
 }
 
-function parseChangelogContent(content: string): ChangelogEntry[] {
+export function parseChangelogContent(content: string): ChangelogEntry[] {
 	const lines = content.split("\n");
 	const entries: ChangelogEntry[] = [];
 
@@ -237,6 +241,53 @@ function parseChangelogContent(content: string): ChangelogEntry[] {
 	}
 
 	return entries;
+}
+
+export async function fetchAvailableReleaseNotes(
+	installedVersion: string,
+	latestVersion: string,
+	mode: SettingValueOf<typeof cfgStartupChangelogMode>,
+	fetchImpl: Fetch = fetch,
+): Promise<string | undefined> {
+	if (mode === "hidden" || !parseChangelogVersion(installedVersion) || !parseChangelogVersion(latestVersion)) {
+		return undefined;
+	}
+	try {
+		const response = await fetchImpl(
+			`https://raw.githubusercontent.com/can1357/oh-my-pi/v${latestVersion}/packages/coding-agent/CHANGELOG.md`,
+			{ signal: withTimeoutSignal(2_000) },
+		);
+		if (!response.ok) return undefined;
+		const content = await response.text();
+		if (Buffer.byteLength(content) > 1024 * 1024) return undefined;
+		const entries = getNewEntries(parseChangelogContent(content), installedVersion).filter(
+			entry => Bun.semver.order(`${entry.major}.${entry.minor}.${entry.patch}`, latestVersion) <= 0,
+		);
+		if (!entries.some(entry => `${entry.major}.${entry.minor}.${entry.patch}` === latestVersion)) return undefined;
+
+		const lines: string[] = [];
+		const bulletLimit = mode === "expanded" ? 5 : 2;
+		for (const entry of entries.reverse()) {
+			const version = `${entry.major}.${entry.minor}.${entry.patch}`;
+			const { changeCount, categoryCounts } = summarizeChangelogEntries([entry]);
+			if (changeCount === 0) return undefined;
+			lines.push(`v${version} · ${formatCategoryBreakdown(categoryCounts)}`);
+			let shown = 0;
+			for (const token of Lexer.lex(entry.content)) {
+				if (token.type !== "list") continue;
+				for (const item of token.items) {
+					if (!item.task && !item.text.trim()) continue;
+					lines.push(`  • ${previewLine(sanitizeText(item.text), TRUNCATE_LENGTHS.CONTENT)}`);
+					if (++shown === bulletLimit) break;
+				}
+				if (shown === bulletLimit) break;
+			}
+		}
+		lines.push(`Changes: https://github.com/can1357/oh-my-pi/compare/v${installedVersion}...v${latestVersion}`);
+		return lines.join("\n");
+	} catch {
+		return undefined;
+	}
 }
 
 async function parseStartupChangelog(

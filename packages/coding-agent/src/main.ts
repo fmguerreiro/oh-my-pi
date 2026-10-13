@@ -130,6 +130,7 @@ import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/p
 import type { LspStartupServerInfo } from "./tools";
 import { sanitizeDisplayWarnings } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
+	fetchAvailableReleaseNotes,
 	getChangelogPath,
 	readLastChangelogVersion,
 	resolveStartupChangelogForDisplay,
@@ -703,13 +704,10 @@ async function runInteractiveMode(
 			mode.renderInitialMessages({ preserveExistingChat: true }),
 		);
 		// A resolved version check must not insert its banner into a partial transcript.
-		checkedVersionPromise.then(newVersion => {
-			if (!cfgStartupCheckUpdate.get(settings)) {
-				return;
-			}
-			if (newVersion) {
-				mode.showNewVersionNotification(newVersion);
-			}
+		void checkedVersionPromise.then(async newVersion => {
+			if (!newVersion || !cfgStartupCheckUpdate.get(settings)) return;
+			const notes = await fetchAvailableReleaseNotes(version, newVersion, cfgStartupChangelogMode.get(settings));
+			if (cfgStartupCheckUpdate.get(settings)) mode.showNewVersionNotification(newVersion, notes);
 		});
 
 		const advisorConfigWarnings = session.getAdvisorConfigWarnings();
