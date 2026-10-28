@@ -7,17 +7,23 @@
  */
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
+import {
+	compactionContextTokens,
+	DEFAULT_COMPACTION_SETTINGS,
+	shouldCompact,
+} from "@oh-my-pi/pi-agent-core/compaction";
 import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import {
-	type ContextBreakdown,
+	type NonMessageTokenSource,
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
 	estimateSkillsTokens,
 	estimateToolSchemaTokens,
 	getToolSchemaMetadataRevision,
 	invalidateToolSchemaMetadata,
-	renderContextUsage,
 } from "../src/status-line/context-usage";
 
 const tokenizer = new Tokenizer();
@@ -114,60 +120,44 @@ describe("estimateToolSchemaTokens", () => {
 	});
 });
 
-/**
- * Contract: the /context panel surfaces estimated snapcompact wire savings —
- * applied swaps show "saves" figures, inactive states say why.
- */
-describe("renderContextUsage snapcompact section", () => {
-	const themeStub = {
-		fg: (_color: string, text: string) => text,
-		bold: (text: string) => text,
-	} as never;
-
-	function breakdownWith(snapcompact: ContextBreakdown["snapcompact"]): ContextBreakdown {
-		return {
-			model: { id: "test-model", name: "Test Model", contextWindow: 200000 } as never,
-			contextWindow: 200000,
-			categories: [],
-			usedTokens: 27929,
-			autoCompactBufferTokens: 0,
-			freeTokens: 172071,
-			snapcompact,
+describe("deferred tool schema accounting", () => {
+	it("does not let Cursor's server-side MCP catalog force compaction below provider usage", () => {
+		const spec: ModelSpec<"anthropic-messages"> = {
+			id: "claude-opus-5-5",
+			name: "Claude Opus",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8192,
 		};
-	}
+		const directModel = buildModel(spec);
+		const cursorModel = buildModel({ ...spec, api: "cursor-agent", provider: "cursor" });
+		const tools = Array.from({ length: 200 }, (_, index) => ({
+			name: `mcp__service__tool_${index}`,
+			description: `Search records ${"search account records with detailed query filters and output metadata ".repeat(110)}`,
+			parameters: type({ query: "string" }),
+		}));
+		const systemPrompt = ["You are an assistant."];
+		const session: NonMessageTokenSource & { model: Model } = {
+			model: directModel,
+			systemPrompt,
+			agent: { state: { tools } },
+		};
+		const direct = computeNonMessageTokens(session, tokenizer);
+		expect(shouldCompact(compactionContextTokens(9000, direct), 100_000, DEFAULT_COMPACTION_SETTINGS)).toBe(true);
 
-	it("renders savings, skip reasons, and the wire total", () => {
-		const output = renderContextUsage(
-			breakdownWith({
-				visionCapable: true,
-				systemPrompt: {
-					applied: true,
-					scope: "all",
-					textTokens: 9768,
-					frames: 2,
-					imageTokens: 6600,
-					savedTokens: 3168,
-				},
-				toolResults: { total: 3, swapped: 0, textTokens: 0, frames: 0, imageTokens: 0, savedTokens: 0 },
-				savedTokens: 3168,
-			}),
-			themeStub,
-		);
-		expect(output).toContain("Snapcompact (estimated wire savings)");
-		expect(output).toContain("System prompt (all): saves ~3.2K (9.8K text → 2 frames ≈ 6.6K)");
-		expect(output).toContain("Tool results: none imaged (3 in history)");
-		// 27929 logical − 3168 saved ≈ 25K on the wire.
-		expect(output).toContain("Next request: ~25K tokens on the wire");
-	});
+		session.model = cursorModel;
+		const cursor = computeNonMessageTokens(session, tokenizer);
+		expect(cursor).toBe(tokenizer.countTokens(systemPrompt));
+		expect(computeNonMessageBreakdown(session, tokenizer).toolsTokens).toBe(0);
+		expect(shouldCompact(compactionContextTokens(9000, cursor), 100_000, DEFAULT_COMPACTION_SETTINGS)).toBe(false);
 
-	it("reports text-only models as inactive", () => {
-		const output = renderContextUsage(breakdownWith({ visionCapable: false, savedTokens: 0 }), themeStub);
-		expect(output).toContain("Snapcompact: inactive (model has no image input)");
-	});
-
-	it("omits the section entirely when no snapcompact setting is on", () => {
-		const output = renderContextUsage(breakdownWith(undefined), themeStub);
-		expect(output).not.toContain("Snapcompact");
+		session.model = directModel;
+		expect(computeNonMessageTokens(session, tokenizer)).toBe(direct);
 	});
 });
 

@@ -11,6 +11,10 @@ use std::{
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	rc::Rc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1082,6 +1086,7 @@ use super::{
 	display::{Format, IndicatorStyle, LocaleQuoting, LongFormat},
 	options::QUOTING_STYLE,
 };
+use crate::time_zone::shell_time_zone;
 
 pub mod options {
 	pub mod format {
@@ -1711,19 +1716,6 @@ fn parse_width(width_match: Option<&String>, host: &Host, runtime: &LsRuntime) -
 }
 
 impl Config {
-	fn shell_time_zone(host: &Host) -> TimeZone {
-		let Some(value) = host.var("TZ") else {
-			return TimeZone::system();
-		};
-		let value = value.strip_prefix(':').unwrap_or(value);
-		if value.is_empty() {
-			return TimeZone::UTC;
-		}
-		TimeZone::get(value)
-			.or_else(|_| TimeZone::posix(value))
-			.unwrap_or(TimeZone::UTC)
-	}
-
 	#[allow(clippy::cognitive_complexity)]
 	pub(super) fn from(
 		options: &clap::ArgMatches,
@@ -2086,7 +2078,7 @@ impl Config {
 			indicator_style,
 			time_format_recent,
 			time_format_older,
-			time_zone: Self::shell_time_zone(host),
+			time_zone: shell_time_zone(host),
 			context,
 			group_directories_first: options.get_flag(options::GROUP_DIRECTORIES_FIRST),
 			line_ending: LineEnding::from_zero_flag(options.get_flag(options::ZERO)),
@@ -3941,6 +3933,7 @@ struct LsRuntime {
 	paths:  ShellPaths,
 	stderr: RefCell<OpenFile>,
 	status: Cell<i32>,
+	cancel: Arc<AtomicBool>,
 }
 
 impl LsRuntime {
@@ -3952,6 +3945,12 @@ impl LsRuntime {
 	/// The shell's filesystem, which every listed path goes through.
 	fn fs(&self) -> &BlockingFs {
 		self.paths.fs()
+	}
+
+	/// Whether the shell cancelled this `ls` (abort, `timeout`): a `-R` walk
+	/// of `/` would otherwise run to the end first.
+	fn is_cancelled(&self) -> bool {
+		self.cancel.load(Ordering::Relaxed)
 	}
 }
 
@@ -3981,6 +3980,7 @@ impl Utility for Ls {
 			paths: host.paths().clone(),
 			stderr: RefCell::new(host.stderr_clone()),
 			status: Cell::new(0),
+			cancel: host.cancel_flag(),
 		});
 		let config = match Config::from(&self.matches, host, Rc::clone(&runtime)) {
 			Ok(config) => config,
@@ -5050,6 +5050,9 @@ pub fn list(locs: Vec<&Path>, config: &Config, out: StreamWriter) -> std::io::Re
 	state.out.flush()?;
 
 	for (pos, path_data) in dirs.iter().enumerate() {
+		if config.runtime.is_cancelled() {
+			break;
+		}
 		let needs_blank_line = pos != 0 || !files.is_empty();
 		// Do read_dir call here to match GNU semantics by printing
 		// read_dir errors before directory headings, names and totals
@@ -5087,6 +5090,9 @@ pub fn list(locs: Vec<&Path>, config: &Config, out: StreamWriter) -> std::io::Re
 
 		// Only runs if it must list recursively.
 		while let Some(dir_data) = state.stack.pop() {
+			if config.runtime.is_cancelled() {
+				break;
+			}
 			let resolved_dir = config.runtime.paths.resolve(&dir_data.0);
 			let read_dir = match fs.read_dir(&resolved_dir) {
 				Err(err) => {

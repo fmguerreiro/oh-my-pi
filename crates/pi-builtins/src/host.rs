@@ -108,7 +108,7 @@ pub(crate) trait Utility: clap::Parser + Send + Sync + 'static {
 /// stdout is the common case).
 pub(crate) struct Host {
 	/// Standard input. Reads observe cancellation, so a blocked pipe read
-	/// returns EOF on abort instead of hanging the shell.
+	/// fails with the cancellation error on abort instead of hanging the shell.
 	pub stdin:  Stdin,
 	/// Standard output; the null device when fd 1 is closed. Raw: utilities
 	/// with bulk output buffer it themselves via [`Host::stdout_writer`].
@@ -234,15 +234,38 @@ enum GuardedStream {
 /// An [`openfiles::Stream`] wrapper that turns `EPIPE` into emulated SIGPIPE.
 /// Clones share the [`Sigpipe`] state, so `stdout_clone()` handles given to
 /// helper threads participate too.
+///
+/// It also emulates the other way a command dies: once the command is
+/// cancelled (abort, `timeout`, `kill %N`), a standalone utility would be
+/// killed and print nothing more, so every later write on either stream is
+/// dropped. This is the one place that silences what a cancelled utility
+/// says about its cancelled reads (`cat: /dev/zero: Operation canceled`,
+/// `tail: internal error`); utilities need no case of their own.
 struct SigpipeGuard {
 	inner:   OpenFile,
 	stream:  GuardedStream,
 	sigpipe: Arc<Sigpipe>,
+	cancel:  CommandCancel,
 }
 
 impl SigpipeGuard {
-	fn wrap(inner: OpenFile, stream: GuardedStream, sigpipe: &Arc<Sigpipe>) -> OpenFile {
-		OpenFile::Stream(Box::new(Self { inner, stream, sigpipe: Arc::clone(sigpipe) }))
+	fn wrap(
+		inner: OpenFile,
+		stream: GuardedStream,
+		sigpipe: &Arc<Sigpipe>,
+		cancel: &CommandCancel,
+	) -> OpenFile {
+		OpenFile::Stream(Box::new(Self {
+			inner,
+			stream,
+			sigpipe: Arc::clone(sigpipe),
+			cancel: cancel.clone(),
+		}))
+	}
+
+	/// Whether the emulated process is dead to this stream's reader.
+	fn discards(&self) -> bool {
+		self.cancel.fired() || matches!(self.stream, GuardedStream::Stderr) && self.sigpipe.is_hit()
 	}
 }
 
@@ -254,14 +277,14 @@ impl Read for SigpipeGuard {
 
 impl Write for SigpipeGuard {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		if matches!(self.stream, GuardedStream::Stderr) && self.sigpipe.is_hit() {
+		if self.discards() {
 			return Ok(buf.len());
 		}
 		self.inner.write(buf).inspect_err(|error| self.sigpipe.record(error))
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
-		if matches!(self.stream, GuardedStream::Stderr) && self.sigpipe.is_hit() {
+		if self.discards() {
 			return Ok(());
 		}
 		self.inner.flush().inspect_err(|error| self.sigpipe.record(error))
@@ -274,6 +297,7 @@ impl openfiles::Stream for SigpipeGuard {
 			inner:   self.inner.clone(),
 			stream:  self.stream,
 			sigpipe: Arc::clone(&self.sigpipe),
+			cancel:  self.cancel.clone(),
 		})
 	}
 
@@ -285,6 +309,21 @@ impl openfiles::Stream for SigpipeGuard {
 	#[cfg(unix)]
 	fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, Error> {
 		self.inner.try_borrow_as_fd()
+	}
+}
+
+/// Whether the command a utility runs for has been cancelled: its token fired
+/// (checked directly, so a diagnostic written before the adapter reacts is
+/// still dropped), or the adapter raised the host's flag.
+#[derive(Clone)]
+struct CommandCancel {
+	flag:  Arc<AtomicBool>,
+	token: Option<CancellationToken>,
+}
+
+impl CommandCancel {
+	fn fired(&self) -> bool {
+		self.flag.load(Ordering::Relaxed) || self.token.as_ref().is_some_and(CancellationToken::is_cancelled)
 	}
 }
 
@@ -339,7 +378,15 @@ impl ShellPaths {
 	/// command in `context`: usually just 0/1/2, plus any from `exec N>` or
 	/// process substitution.
 	pub fn new<SE: ShellExtensions>(context: &ExecutionContext<'_, SE>) -> Self {
+		// Scoped to the command's own cancellation (the operand's token under
+		// `timeout`), so a utility reading a host file stops when it fires
+		// instead of draining the file first: `timeout 1 cat /dev/zero` never
+		// returned.
 		let filesystem = context.shell.filesystem().blocking();
+		let filesystem = match context.cancel_token() {
+			Some(token) => filesystem.with_cancellation(token),
+			None => filesystem,
+		};
 		#[cfg(unix)]
 		let descriptors: Arc<[(brush_core::ShellFd, OpenFile)]> = context
 			.open_fds()
@@ -597,9 +644,9 @@ impl Host {
 	/// flag, and a cancelled walk traverses the whole tree before the utility
 	/// notices (#3949, #3933). The walker surfaces the error as
 	/// `WalkError::Interrupted`; `grep`, `rg`, and `fd` tell it from a real
-	/// failure with [`Host::is_cancelled`] and stay silent, since the shell
-	/// adapter owns the cancellation status (130), while `find` prints it as
-	/// `Error: cancelled`.
+	/// failure with [`Host::is_cancelled`], since the shell adapter owns the
+	/// cancellation status (130). Whatever a utility prints once cancelled is
+	/// dropped anyway (see [`SigpipeGuard`]).
 	pub fn cancel_heartbeat(&self) -> impl Fn() -> io::Result<()> + Send + Sync + 'static {
 		let cancel = Arc::clone(&self.cancel);
 		move || {
@@ -649,6 +696,26 @@ impl Host {
 	pub fn error(&mut self, message: impl std::fmt::Display, code: i32) {
 		let _ = writeln!(self.stderr, "{}: {message}", self.name);
 		self.fail(code);
+	}
+
+	/// Writes `<name>: <message>` followed by GNU's `Try '<name> --help' for
+	/// more information.`, records exit status `code`, and returns it.
+	///
+	/// For usage errors found after parsing (operand combinations, invalid
+	/// option values); clap's own errors are rendered by the [`Util`] adapter.
+	pub fn usage_error(&mut self, message: impl std::fmt::Display, code: i32) -> i32 {
+		let _ = writeln!(self.stderr, "{0}: {message}\nTry '{0} --help' for more information.", self.name);
+		self.fail(code);
+		code
+	}
+
+	/// Writes only the `Try '<name> --help' for more information.` pointer,
+	/// after diagnostics already printed; records exit status `code` and
+	/// returns it.
+	pub fn try_help(&mut self, code: i32) -> i32 {
+		let _ = writeln!(self.stderr, "Try '{} --help' for more information.", self.name);
+		self.fail(code);
+		code
 	}
 
 	/// Duplicates stdout, for utilities that hand a writer to a helper thread.
@@ -801,13 +868,60 @@ impl RunningCommand {
 /// -exec` give their children.
 pub(crate) struct ShellCommand {
 	argv:  Vec<OsString>,
+	argv0: Option<OsString>,
 	cwd:   Option<PathBuf>,
 	stdin: Option<OpenFile>,
+	env:   Vec<EnvChange>,
+}
+
+/// One environment change a [`ShellCommand`] makes for its own command.
+enum EnvChange {
+	Clear,
+	Remove(String),
+	Set(String, String),
 }
 
 impl ShellCommand {
 	pub fn new(argv: Vec<OsString>) -> Self {
-		Self { argv, cwd: None, stdin: None }
+		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new() }
+	}
+
+	/// Presents `argv0` to the command as its `argv[0]` (`env -a`); the
+	/// command is still looked up by the `argv[0]` given to
+	/// [`ShellCommand::new`]. A builtin receives it as its first argument.
+	pub fn argv0(mut self, argv0: impl Into<OsString>) -> Self {
+		self.argv0 = Some(argv0.into());
+		self
+	}
+
+	/// Starts the command from an empty environment (`env -i`): every
+	/// exported variable is gone. Unexported shell variables, which were never
+	/// part of the environment, stay.
+	///
+	/// This and [`ShellCommand::env_remove`] and [`ShellCommand::env`] apply
+	/// in call order, to this command only: the worker subshell gets its
+	/// variables back once the command finishes, so neither later commands
+	/// nor the invoking shell see the change. A command with environment
+	/// changes is looked up on its own `PATH`, or with no `PATH` on the
+	/// default search path `execvp` uses, never through the shell's hash
+	/// table.
+	pub fn env_clear(mut self) -> Self {
+		self.env.push(EnvChange::Clear);
+		self
+	}
+
+	/// Removes the variable `name` for the command (`env -u`), exported or
+	/// not. See [`ShellCommand::env_clear`] for the scope of the change.
+	pub fn env_remove(mut self, name: impl Into<String>) -> Self {
+		self.env.push(EnvChange::Remove(name.into()));
+		self
+	}
+
+	/// Sets `name` to `value` in the command's environment (`env NAME=VALUE`).
+	/// See [`ShellCommand::env_clear`] for the scope of the change.
+	pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+		self.env.push(EnvChange::Set(name.into(), value.into()));
+		self
 	}
 
 	/// Runs in `dir` (relative to the shell's working directory) instead of
@@ -942,18 +1056,90 @@ async fn run_in<SE: ShellExtensions>(
 	if shell.working_dir() != dir {
 		shell.set_working_dir(dir).await?;
 	}
+	if command.env.is_empty() {
+		return dispatch(shell, base, command, None).await;
+	}
+	// The worker is reused for later commands: run on a scratch environment
+	// and put the worker's own back whatever the outcome.
+	let saved = shell.env().clone();
+	*shell.env_mut() = changed_env(&saved, &command.env)?;
+	let path_dirs = search_path(shell);
+	let status = dispatch(shell, base, command, Some(path_dirs)).await;
+	*shell.env_mut() = saved;
+	status
+}
+
+/// `env` with `changes` applied, flattened into one global scope: a change
+/// must win over every scope, and the command runs no shell functions whose
+/// locals could need the stack.
+fn changed_env(
+	env: &brush_core::env::ShellEnvironment,
+	changes: &[EnvChange],
+) -> Result<brush_core::env::ShellEnvironment, Error> {
+	let mut vars: HashMap<String, brush_core::ShellVariable> =
+		env.iter().map(|(name, var)| (name.clone(), var.clone())).collect();
+	for change in changes {
+		match change {
+			EnvChange::Clear => vars.retain(|_, var| !var.is_exported()),
+			EnvChange::Remove(name) => {
+				vars.remove(name);
+			},
+			EnvChange::Set(name, value) => {
+				let mut var = brush_core::ShellVariable::new(brush_core::ShellValue::String(value.clone()));
+				var.export();
+				vars.insert(name.clone(), var);
+			},
+		}
+	}
+	let mut changed = brush_core::env::ShellEnvironment::new();
+	for (name, var) in vars {
+		changed.set_global(name, var)?;
+	}
+	Ok(changed)
+}
+
+/// The directories `execvp` would search for a command run with `shell`'s
+/// environment: its `PATH`, else the C library's default. Relative and empty
+/// entries name directories under the working directory.
+fn search_path<SE: ShellExtensions>(shell: &Shell<SE>) -> Vec<PathBuf> {
+	const DEFAULT_PATH: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
+		"/bin:/usr/bin"
+	} else {
+		"/usr/bin:/bin"
+	};
+	let path = shell.env().get_str("PATH", shell);
+	let path = path.as_deref().unwrap_or(DEFAULT_PATH);
+	brush_core::sys::fs::split_paths(path)
+		.map(|dir| shell.working_dir().join(dir))
+		.collect()
+}
+
+/// Dispatches `command` in the worker `shell` as a simple command, searching
+/// `path_dirs` for programs when given.
+async fn dispatch<SE: ShellExtensions>(
+	shell: &mut Shell<SE>,
+	base: &ExecutionParameters,
+	command: ShellCommand,
+	path_dirs: Option<Vec<PathBuf>>,
+) -> Result<CommandStatus, Error> {
 	let mut params = base.clone();
 	params.set_fd(OpenFiles::STDIN_FD, or_null(command.stdin)?);
 	let cancel = params.cancel_token();
-	let args: Vec<CommandArg> = command
+	let mut args: Vec<CommandArg> = command
 		.argv
 		.into_iter()
 		.map(|arg| CommandArg::from(arg.to_string_lossy().into_owned()))
 		.collect();
 	let name = args.first().map(ToString::to_string).unwrap_or_default();
+	let argv0 = command.argv0.map(|argv0| argv0.to_string_lossy().into_owned());
+	if let (Some(argv0), Some(first)) = (&argv0, args.first_mut()) {
+		*first = CommandArg::from(argv0.clone());
+	}
 	let mut simple =
 		SimpleCommand::new(ShellForCommand::ParentShell(shell), params, name, args);
 	simple.use_functions = false;
+	simple.argv0 = argv0;
+	simple.path_dirs = path_dirs;
 	let spawned = match simple.execute().await {
 		Ok(spawned) => spawned,
 		// Nothing ran; the utility reports that in its own words.
@@ -1240,15 +1426,23 @@ impl ChildEnv {
 /// Standard input for a utility builtin: the command's fd 0 plus the
 /// cancellation flag.
 ///
-/// On unix, when fd 0 is a real descriptor, reads wait for readiness in short
+/// On unix, when fd 0 is a descriptor whose reads can block (a pipe, FIFO,
+/// terminal, socket or device), reads wait for readiness in short
 /// slices so an abort or `timeout` is observed even when input never arrives on
-/// a blocked pipe; the utility then sees EOF and unwinds cleanly rather than
-/// leaving a detached thread writing to descriptors the host has moved on from.
+/// a blocked pipe. A cancelled read fails with [`pi_vfs::cancelled`], not EOF,
+/// so a utility never reports a result for input it did not finish reading
+/// (`timeout 1 md5sum - < big` printed a checksum of a prefix); it unwinds
+/// rather than leaving a detached thread writing to descriptors the host has
+/// moved on from, and what it says about the error is dropped.
 pub(crate) struct Stdin {
 	file:   OpenFile,
 	#[cfg_attr(not(unix), allow(dead_code, reason = "readiness polling is unix-only"))]
 	fd:     Option<i32>,
-	cancel: Arc<AtomicBool>,
+	/// The command's cancellation. A provider-backed fd 0 (`< virtual://f`) has
+	/// no descriptor to poll, and the facade that opened it is usually the
+	/// outer command's, not this command's (a `timeout` operand), so its reads
+	/// are raced against this command's token directly.
+	cancel: CommandCancel,
 }
 
 impl Stdin {
@@ -1269,17 +1463,28 @@ impl Stdin {
 	pub fn try_clone(&self) -> io::Result<Self> {
 		let file = self.file.try_clone()?;
 		let fd = pollable_fd(&file);
-		Ok(Self { file, fd, cancel: Arc::clone(&self.cancel) })
+		Ok(Self { file, fd, cancel: self.cancel.clone() })
+	}
+
+	/// Whether the command was cancelled, for utilities that read fd 0's
+	/// descriptor directly (`wc -c` splices a pipe) and so bypass the reads
+	/// that fail once it is.
+	pub fn is_cancelled(&self) -> bool {
+		self.cancel.fired()
 	}
 }
 
 /// The raw descriptor [`Stdin`] polls for readiness, so a blocked read
-/// observes cancellation; `None` off unix or for in-process streams.
+/// observes cancellation; `None` off unix, for in-process streams, and for a
+/// descriptor whose reads never block (see [`pi_vfs::reads_can_block`]).
 fn pollable_fd(file: &OpenFile) -> Option<i32> {
 	#[cfg(unix)]
 	{
 		use std::os::fd::AsRawFd;
-		file.try_borrow_as_fd().ok().map(|fd| fd.as_raw_fd())
+		file.try_borrow_as_fd()
+			.ok()
+			.filter(|fd| pi_vfs::fd_reads_can_block(*fd))
+			.map(|fd| fd.as_raw_fd())
 	}
 	#[cfg(not(unix))]
 	{
@@ -1290,32 +1495,19 @@ fn pollable_fd(file: &OpenFile) -> Option<i32> {
 
 impl Read for Stdin {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		if self.cancel.load(Ordering::Relaxed) {
-			return Ok(0);
+		if self.cancel.fired() {
+			return Err(pi_vfs::cancelled());
 		}
 		#[cfg(unix)]
 		if let Some(fd) = self.fd {
-			loop {
-				if self.cancel.load(Ordering::Relaxed) {
-					return Ok(0);
-				}
-				let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-				// SAFETY: one `pollfd` valid for the call; `fd` is owned by the
-				// live `OpenFile` held in this struct.
-				let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
-				if ready < 0 {
-					let err = io::Error::last_os_error();
-					if err.kind() == io::ErrorKind::Interrupted {
-						continue;
-					}
-					return Err(err);
-				}
-				if ready > 0 {
-					break;
-				}
-			}
+			// SAFETY: `fd` is owned by the live `OpenFile` held in this struct.
+			let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+			pi_vfs::wait_readable(fd, || self.cancel.fired())?;
 		}
-		self.file.read(buf)
+		match (&self.file, &self.cancel.token) {
+			(OpenFile::Vfs(file), Some(token)) => file.read_until_cancelled(buf, token),
+			_ => self.file.read(buf),
+		}
 	}
 }
 
@@ -1738,6 +1930,7 @@ fn build_host<SE: ShellExtensions>(
 	// One flag, shared: the adapter flips it on cancellation, and a blocked
 	// `Stdin::read` must observe the very same flag or it never wakes.
 	let cancel = Arc::new(AtomicBool::new(false));
+	let command_cancel = CommandCancel { flag: Arc::clone(&cancel), token: context.cancel_token() };
 
 	let stdout = or_null(context.try_fd(OpenFiles::STDOUT_FD))?;
 	let stdout_handle = if checks_stdout_path { output_handle(&stdout) } else { None };
@@ -1753,21 +1946,21 @@ fn build_host<SE: ShellExtensions>(
 	// so it takes the stdout guard: once the reader is gone every write fails
 	// and nothing is observable either way.
 	let (merged_out, stderr) = if stdout_destination.shares_with(&stderr_destination) {
-		let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stdout, &sigpipe);
+		let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stdout, &sigpipe, &command_cancel);
 		let shared =
 			Arc::new(Mutex::new(StreamWriter::new(guarded, stderr_destination.regular_file)));
 		(Some(Arc::clone(&shared)), StreamWriter::Shared(shared))
 	} else {
-		let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stderr, &sigpipe);
+		let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stderr, &sigpipe, &command_cancel);
 		(None, StreamWriter::new(guarded, stderr_destination.regular_file))
 	};
-	let stdout = SigpipeGuard::wrap(stdout, GuardedStream::Stdout, &sigpipe);
+	let stdout = SigpipeGuard::wrap(stdout, GuardedStream::Stdout, &sigpipe, &command_cancel);
 
 	Ok(Host {
 		stdin: Stdin {
 			file:   or_null(stdin)?,
 			fd:     stdin_fd,
-			cancel: Arc::clone(&cancel),
+			cancel: command_cancel,
 		},
 		stdout,
 		stderr,
@@ -1844,8 +2037,8 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, GuardedStream, HashMap, Host, OpenFile, OpenFiles, OsString, PathBuf, Read,
-		ShellPaths, Sigpipe, SigpipeGuard, Stdin, StreamWriter, Utility, Write, io, openfiles,
+		Arc, AtomicBool, CommandCancel, GuardedStream, HashMap, Host, OpenFile, OpenFiles, OsString,
+		PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Stdin, StreamWriter, Utility, Write, io, openfiles,
 		output_handle, run_caught,
 	};
 
@@ -1911,19 +2104,26 @@ mod testing {
 			};
 			let cancel = Arc::new(AtomicBool::new(false));
 			let sigpipe = Arc::new(Sigpipe::default());
+			let command_cancel = CommandCancel { flag: Arc::clone(&cancel), token: None };
 			let stdout = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stdout))));
 			let stderr = OpenFile::Stream(Box::new(MemStream::writer(Arc::clone(&capture.stderr))));
 			let host = Self {
 				stdin:                 Stdin {
 					file:   OpenFile::Stream(stdin),
 					fd:     None,
-					cancel: Arc::clone(&cancel),
+					cancel: command_cancel.clone(),
 				},
-				stdout:                SigpipeGuard::wrap(stdout, GuardedStream::Stdout, &sigpipe),
+				stdout:                SigpipeGuard::wrap(
+					stdout,
+					GuardedStream::Stdout,
+					&sigpipe,
+					&command_cancel,
+				),
 				stderr:                StreamWriter::line(SigpipeGuard::wrap(
 					stderr,
 					GuardedStream::Stderr,
 					&sigpipe,
+					&command_cancel,
 				)),
 				stdout_is_file:        false,
 				stdout_handle:         None,
@@ -1951,7 +2151,8 @@ mod testing {
 			self.stdout_is_file = super::Destination::of(&file).regular_file;
 			self.stdout_handle = output_handle(&file);
 			self.stdout_metadata.take();
-			self.stdout = SigpipeGuard::wrap(file, GuardedStream::Stdout, &self.sigpipe);
+			let command_cancel = CommandCancel { flag: Arc::clone(&self.cancel), token: None };
+			self.stdout = SigpipeGuard::wrap(file, GuardedStream::Stdout, &self.sigpipe, &command_cancel);
 		}
 
 		/// Sets an exported variable on a test host.
@@ -1969,6 +2170,18 @@ mod testing {
 		pub(crate) fn cancel_flag_for_test(&self) -> Arc<AtomicBool> {
 			Arc::clone(&self.cancel)
 		}
+	}
+
+	/// `poll` never reports the null device readable on macOS and the BSDs, so
+	/// a utility whose stdin is `/dev/null` (the bash tool wires it there)
+	/// waited for cancellation before it saw EOF. Stdin from a pipe still polls.
+	#[cfg(unix)]
+	#[test]
+	fn stdin_from_the_null_device_is_not_polled() {
+		let null = openfiles::null().unwrap();
+		assert_eq!(super::pollable_fd(&null), None);
+		let (reader, _writer) = std::io::pipe().unwrap();
+		assert!(super::pollable_fd(&OpenFile::from(reader)).is_some());
 	}
 
 	#[cfg(windows)]
@@ -2013,6 +2226,17 @@ mod testing {
 			},
 		};
 		(code, capture)
+	}
+
+	/// Writes `small` holding `needle` and a sparse `big` twice the line limit
+	/// of `grep` and `rg`, with no line terminator and no disk space used.
+	#[cfg(all(unix, feature = "util.grep"))]
+	pub(crate) fn tree_with_sparse_file() -> tempfile::TempDir {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("small"), "needle\n").unwrap();
+		let big = std::fs::File::create(tree.path().join("big")).unwrap();
+		big.set_len(2 * crate::grep::MAX_LINE_BYTES as u64).unwrap();
+		tree
 	}
 
 	/// Runs `script` in a real shell with every builtin registered, from `cwd`
@@ -2314,4 +2538,6 @@ mod testing {
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{Capture, run_script, run_util};
+#[cfg(all(test, unix, feature = "util.grep"))]
+pub(crate) use testing::tree_with_sparse_file;
 

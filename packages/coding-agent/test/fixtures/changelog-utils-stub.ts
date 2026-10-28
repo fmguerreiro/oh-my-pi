@@ -1,5 +1,10 @@
 import packageJson from "../../package.json" with { type: "json" };
 
+export * from "../../../utils/src/format";
+export * from "../../../utils/src/sanitize-text";
+export * from "../../../utils/src/tab-spacing";
+export * from "../../../utils/src/which";
+
 export const VERSION = packageJson.version;
 export const getLastChangelogVersionPath = (): string => "";
 export const getChangelogPath = (): string | undefined => undefined;

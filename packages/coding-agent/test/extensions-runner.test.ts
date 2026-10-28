@@ -1204,6 +1204,40 @@ describe("ExtensionRunner", () => {
 			expect(stopResult).toEqual({ continue: true, additionalContext: "Run one more pass." });
 		});
 
+		it("keeps both cleanup and unfinished-work feedback from separate stop handlers", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "session-stop-merge.ts"),
+				`
+				export default function(pi) {
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "", reason: "Clean abandoned process." }));
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "Continue unfinished work." }));
+				}
+			`,
+			);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const message = createAssistantMessage("Next is another unfinished change.");
+			const result = await runner.emitSessionStop({
+				messages: [message],
+				turn_id: 1,
+				last_assistant_message: message,
+				session_id: "session-123",
+				session_file: "/tmp/session.jsonl",
+				stop_hook_active: false,
+				signal: new AbortController().signal,
+			});
+			expect(result).toEqual({
+				continue: true,
+				additionalContext: "Clean abandoned process.\n\nContinue unfinished work.",
+			});
+		});
+
 		it("skips cancelled handlers, releases in-flight handlers, and preserves timeout errors", async () => {
 			const extensionPath = path.join(tempDir.path(), "cancel-session-stop.ts");
 			const startedPath = path.join(tempDir.path(), "session-stop-started.txt");
@@ -2554,6 +2588,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -2623,9 +2658,49 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				"Approve dangerous_tool for this session",
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
+		});
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(expect.any(String), ["Approve", "Deny"]);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
@@ -3752,8 +3827,8 @@ describe("ExtensionRunner", () => {
 			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
 		});
 
-		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {
-			// write.ts dispatches xd:// devices with xdevApproved: true because its
+		it("forfeits the xd:// prompt bypass when a handler revises the input", async () => {
+			// write.ts dispatches xd:// devices with xdevPolicyKey because its
 			// outer gate already approved the ORIGINAL device input. A tool_call
 			// revision may raise the tier, so revised input must face the full gate
 			// (here: no interactive UI => reject) instead of riding the outer approval.
@@ -3779,7 +3854,7 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 			} as never;
 
 			await expect(
@@ -3857,7 +3932,7 @@ describe("ExtensionRunner", () => {
 			let effectiveTier: string | undefined;
 			const xdevContext = {
 				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
-				xdevApproved: true,
+				xdevPolicyKey: "bash",
 				xdevTierResolved: (tier: string) => {
 					effectiveTier = tier;
 				},

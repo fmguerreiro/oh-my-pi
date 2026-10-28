@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { BunPlugin } from "bun";
+import { nativeAddonStatus } from "../../../natives/native/loader-state.js";
 import { resolveBundledChangelogPath } from "../../src/utils/changelog";
 
 interface HeapProbeResult {
@@ -34,13 +35,7 @@ async function runProbe(command: string[], cwd?: string): Promise<BundleProbeRes
 	return JSON.parse(stdout) as BundleProbeResult;
 }
 
-/**
- * Swap `@oh-my-pi/pi-utils` and the changelog module's `../config` import for a
- * dependency-free stub. Both pull the native addon loader into the bundle graph, and
- * that loader resolves `pi_natives.<platform>.node` relative to the emitted artifact,
- * so any probe written outside the repo fails to start. The subject under test is
- * emitted-asset resolution, not native loading.
- */
+// Asset probes stage real renderer bindings beside the bundle and stub unrelated config/logging.
 function changelogUtilsStubPlugin(): BunPlugin {
 	return {
 		name: "changelog-utils-stub",
@@ -104,6 +99,12 @@ describe("changelog static import resources", () => {
 				plugins: [changelogUtilsStubPlugin()],
 			});
 			expect(buildOutput.success, buildOutput.logs.map(log => log.message).join("\n")).toBe(true);
+
+			const addon = nativeAddonStatus();
+			if (!addon) throw new Error("Expected the source changelog import to load the native addon");
+			const nativeDir = path.join(tempDir, "native");
+			await fs.mkdir(nativeDir);
+			await fs.copyFile(addon.path, path.join(nativeDir, path.basename(addon.path)));
 
 			const outputs = await fs.readdir(bundleDir);
 			expect(outputs.some(output => output.endsWith(".md"))).toBe(true);

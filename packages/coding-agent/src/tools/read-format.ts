@@ -32,6 +32,7 @@ import type { ReadToolDetails, ReadTruncationStats } from "@oh-my-pi/pi-tui/tool
 import { isRawSelector, type ParsedSelector, resolveTailSelector, selToOffsetLimit } from "./read-selector";
 import { formatBytes, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import type { TruncationMetaInput } from "./output-meta";
 import { toolResult } from "./tool-result";
 
 import { cfgReadRenderMarkdown } from "./settings";
@@ -39,6 +40,20 @@ import { cfgReadRenderMarkdown } from "./settings";
 export function toReadTruncationStats(result: TruncationResult): ReadTruncationStats {
 	const { content: _content, ...stats } = result;
 	return stats;
+}
+
+/** Keep descriptive diagnostics out of raw source text while retaining them in the result. */
+export function appendReadNotice(text: string, notice: string, details: ReadToolDetails, separator = "\n"): string {
+	if (details.raw) {
+		(details.notes ??= []).push(notice);
+		return text;
+	}
+	return text ? `${text}${separator}${notice}` : notice;
+}
+
+/** Carry raw mode through readers that pass suffix-resolution metadata to the shared prefix emitter. */
+export function markRawSuffixResolution(resolution: ReadToolDetails["suffixResolution"], raw: boolean): void {
+	if (resolution && raw) resolution.raw = true;
 }
 
 function prependLineNumbers(text: string, startNum: number): string {
@@ -148,11 +163,15 @@ export function countTextLines(text: string): number {
 	return text.length === 0 ? 0 : countNewlines(text) + 1;
 }
 
-/** `(raw ? text.split("\n") : splitAddressableFileLines(text)).length` without splitting. */
-function countSplitLines(text: string, raw: boolean): number {
-	if (raw) return countNewlines(text) + 1;
+/** Count addressable lines without splitting; a terminal LF closes the last line. */
+function countSplitLines(text: string): number {
 	if (text.length === 0) return 0;
 	return countNewlines(text) + (text.endsWith("\n") ? 0 : 1);
+}
+
+/** Raw reads retain the addressable empty line of an empty source, as disk reads do. */
+function countRawLines(text: string): number {
+	return text.length === 0 ? 1 : countSplitLines(text);
 }
 
 /** `lines.slice(start, end).join("\n")` as a substring of the `text` that `lines` was split from. */
@@ -165,11 +184,10 @@ function sliceLineRange(text: string, lines: readonly string[], start: number, e
 }
 
 /**
- * `text.split("\n").slice(start, end).join("\n")` as a substring of `text`, found
- * by walking newlines so raw reads never split the whole text for one window.
- * `start` must address an existing segment.
+ * Slice a raw range without splitting the whole text. Open-ended reads retain
+ * the terminal newline when it closes the last addressable line.
  */
-function sliceRawLineRange(text: string, start: number, end: number): string {
+function sliceRawLineRange(text: string, start: number, end: number, includeFinalNewline: boolean): string {
 	let from = 0;
 	for (let i = 0; i < start; i++) from = text.indexOf("\n", from) + 1;
 	let to = from;
@@ -177,7 +195,7 @@ function sliceRawLineRange(text: string, start: number, end: number): string {
 		const newlineAt = text.indexOf("\n", to);
 		to = newlineAt === -1 ? text.length + 1 : newlineAt + 1;
 	}
-	return text.slice(from, Math.max(from, to - 1));
+	return text.slice(from, Math.max(from, to - (includeFinalNewline ? 0 : 1)));
 }
 
 export function contiguousLineNumbers(startLine: number, count: number): number[] {
@@ -288,8 +306,7 @@ export interface InMemoryTextOptions {
 
 /**
  * Render any read selector against in-memory text. Pins `:-N` tails to the
- * text's own line count (raw mode addresses `\n` segments verbatim; otherwise
- * the hashline-addressable split), then dispatches multi-range selectors to
+ * text's addressable line count, then dispatches multi-range selectors to
  * {@link buildInMemoryMultiRangeResult} and everything else to
  * {@link buildInMemoryTextResult}. Raw mode is derived from the selector.
  */
@@ -300,7 +317,7 @@ export async function buildInMemorySelectorResult(
 	options: Omit<InMemoryTextOptions, "raw">,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	const raw = isRawSelector(parsed);
-	const totalLines = countSplitLines(text, raw);
+	const totalLines = raw ? countRawLines(text) : countSplitLines(text);
 	const sel = resolveTailSelector(parsed, totalLines);
 	if (sel.kind === "lines" && sel.ranges.length > 1) {
 		return buildInMemoryMultiRangeResult(session, text, sel.ranges, { ...options, raw });
@@ -319,10 +336,11 @@ export async function buildInMemoryTextResult(
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
 	const details = options.details ?? {};
 	const rawDisplay = options.raw === true;
+	if (rawDisplay) details.raw = true;
 	// Raw mode addresses verbatim `\n` segments and shows no block context, so it
 	// slices the window straight out of `text`; only addressable reads need every line.
 	const allLines = rawDisplay ? undefined : splitAddressableFileLines(text);
-	const totalLines = allLines ? allLines.length : countNewlines(text) + 1;
+	const totalLines = allLines ? allLines.length : countRawLines(text);
 	details.totalLines = totalLines;
 	// User-requested 0-indexed range start. Lines BEFORE this are leading
 	// context (added below if offset is explicit).
@@ -341,9 +359,8 @@ export async function buildInMemoryTextResult(
 		!rawDisplay && offset !== undefined && offset > 1,
 		!rawDisplay && limit !== undefined,
 	);
-	const startLine = expanded.startLine;
-	const endLineExpanded = expanded.endLine;
-	const startLineDisplay = startLine + 1;
+	let startLine = expanded.startLine;
+	const endLine = expanded.endLine;
 
 	const resultBuilder = toolResult(details);
 	if (options.sourcePath) {
@@ -361,24 +378,39 @@ export async function buildInMemoryTextResult(
 			totalLines === 0
 				? `The ${options.entityLabel} is empty.`
 				: `Use :1 to read from the start, or :${totalLines} to read the last line.`;
-		return resultBuilder
-			.text(
-				`Line ${requestedStart + 1} is beyond end of ${options.entityLabel} (${totalLines} lines total). ${suggestion}`,
-			)
-			.done();
+		const notice = `Line ${requestedStart + 1} is beyond end of ${options.entityLabel} (${totalLines} lines total). ${suggestion}`;
+		return resultBuilder.text(appendReadNotice("", notice, details)).done();
 	}
 
-	const endLine = endLineExpanded;
 	// Measure the range as a substring of `text` (equal to joining it) so a large range isn't
 	// copied only for `truncateHead` to keep its head. Branches that emit the whole range
 	// re-join it so the result never pins `text` through a substring.
-	const selectedRange = allLines
+	let selectedRange = allLines
 		? sliceLineRange(text, allLines, startLine, endLine)
-		: sliceRawLineRange(text, startLine, endLine);
+		: sliceRawLineRange(
+				text,
+				startLine,
+				endLine,
+				limit === undefined && endLine === totalLines && text.endsWith("\n"),
+			);
+	let truncation = ignoreResultLimits ? noTruncResult(selectedRange) : truncateHead(selectedRange);
+	// The leading context line must not cost the requested start line: when the byte budget
+	// stops at or inside it, `:<start>` would widen to the same context and repeat this page.
+	// The whole text is in memory, so drop the context and page from the requested line.
+	if (
+		allLines &&
+		startLine < requestedStart &&
+		(truncation.firstLineExceedsLimit ||
+			(truncation.truncated && (truncation.outputLines ?? 0) <= requestedStart - startLine))
+	) {
+		startLine = requestedStart;
+		selectedRange = sliceLineRange(text, allLines, startLine, endLine);
+		truncation = truncateHead(selectedRange);
+	}
+	const startLineDisplay = startLine + 1;
 	const joinSelectedLines = (): string =>
 		(allLines ? allLines.slice(startLine, endLine) : selectedRange.split("\n")).join("\n");
 	const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
-	const truncation = ignoreResultLimits ? noTruncResult(selectedRange) : truncateHead(selectedRange);
 	// Any display short of the whole text shows block context around it.
 	if (
 		!rawDisplay &&
@@ -391,6 +423,7 @@ export async function buildInMemoryTextResult(
 
 	const shouldAddHashLines = displayMode.hashLines;
 	const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+	details.rowPrefixes = shouldAddHashLines || shouldAddLineNumbers;
 	const hashContext =
 		shouldAddHashLines && options.sourcePath
 			? recordFullHashlineContext(
@@ -436,9 +469,7 @@ export async function buildInMemoryTextResult(
 		});
 
 	let outputText: string;
-	let truncationInfo:
-		| { result: TruncationResult; options: { direction: "head"; startLine?: number; totalFileLines?: number } }
-		| undefined;
+	let truncationInfo: { result: TruncationResult; options: TruncationMetaInput } | undefined;
 
 	if (truncation.firstLineExceedsLimit) {
 		const firstLine = allLines ? (allLines[startLine] ?? "") : selectedRange.split("\n", 1)[0];
@@ -476,9 +507,15 @@ export async function buildInMemoryTextResult(
 		details.truncation = toReadTruncationStats(truncation);
 		truncationInfo = {
 			result: truncation,
-			options: { direction: "head", startLine: startLineDisplay, totalFileLines: totalLines },
+			// Without `maxBytes` the notice reports the bytes shown as the limit.
+			options: {
+				direction: "head",
+				startLine: startLineDisplay,
+				totalFileLines: totalLines,
+				maxBytes: DEFAULT_MAX_BYTES,
+			},
 		};
-	} else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalLines) {
+	} else if (!rawDisplay && userLimitedLines !== undefined && startLine + userLimitedLines < totalLines) {
 		const remaining = totalLines - (startLine + userLimitedLines);
 		const nextOffset = startLine + userLimitedLines + 1;
 
@@ -526,12 +563,14 @@ export async function buildInMemoryMultiRangeResult(
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
 	const details = options.details ?? {};
+	if (options.raw) details.raw = true;
 	// Raw mode only emits the requested windows, so it never splits the whole text.
 	const allLines = options.raw === true ? undefined : splitAddressableFileLines(text);
-	const totalLines = allLines ? allLines.length : countNewlines(text) + 1;
+	const totalLines = allLines ? allLines.length : countRawLines(text);
 	details.totalLines = totalLines;
 	const shouldAddHashLines = displayMode.hashLines;
 	const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+	details.rowPrefixes = shouldAddHashLines || shouldAddLineNumbers;
 	const hashContext =
 		shouldAddHashLines && options.sourcePath
 			? recordFullHashlineContext(
@@ -562,7 +601,12 @@ export async function buildInMemoryMultiRangeResult(
 		if (!allLines) {
 			// Re-join (as the split path did) so the part never pins `text` through a substring.
 			rawParts.push(
-				sliceRawLineRange(text, range.startLine - 1, effectiveEnd)
+				sliceRawLineRange(
+					text,
+					range.startLine - 1,
+					effectiveEnd,
+					range.endLine === undefined && effectiveEnd === totalLines && text.endsWith("\n"),
+				)
 					.split("\n")
 					.join("\n"),
 			);
@@ -571,7 +615,7 @@ export async function buildInMemoryMultiRangeResult(
 
 	let outputText = "";
 	if (!allLines) {
-		outputText = rawParts.length > 0 ? rawParts.join("\n\n…\n\n") : "";
+		outputText = rawParts.join("\n");
 	} else if (visibleSpans.length > 0) {
 		if (options.sourcePath && !spansCoverEveryLine(visibleSpans, totalLines)) {
 			await warmBlockContext({ path: options.sourcePath, text });
@@ -595,8 +639,7 @@ export async function buildInMemoryMultiRangeResult(
 		const bound = range.endLine !== undefined ? `${range.startLine}-${range.endLine}` : `${range.startLine}`;
 		notices.push(`[Range ${bound} is beyond end of ${options.entityLabel} (${totalLines} lines total); skipped]`);
 	}
-	const finalText =
-		notices.length > 0 ? (outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n")) : outputText;
+	const finalText = notices.length > 0 ? appendReadNotice(outputText, notices.join("\n"), details) : outputText;
 	if (hashContext?.tag && options.sourcePath && seenLines) {
 		getEditStore(session).recordSeenLines(options.sourcePath, hashContext.tag, seenLines);
 	}
@@ -616,8 +659,11 @@ export function decodeUtf8Text(bytes: Uint8Array): string | null {
 	}
 }
 
-export function prependSuffixResolutionNotice(text: string, suffixResolution?: { from: string; to: string }): string {
-	if (!suffixResolution) return text;
+export function prependSuffixResolutionNotice(
+	text: string,
+	suffixResolution?: ReadToolDetails["suffixResolution"],
+): string {
+	if (!suffixResolution || suffixResolution.raw) return text;
 
 	const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
 	return text ? `${notice}\n${text}` : notice;
