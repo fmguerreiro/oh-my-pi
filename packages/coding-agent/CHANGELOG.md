@@ -9,6 +9,7 @@
 ### Fixed
 
 - Startup update notices keep showing available release notes when some newer releases have no listed changes.
+- Agents now verify prose edits against meaning and required details instead of unrelated smoke runs, while behavioral changes still require runtime verification.
 ## [18.13.2] - 2026-10-27
 
 ### Added

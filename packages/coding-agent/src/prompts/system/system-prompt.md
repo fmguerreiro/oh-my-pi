@@ -209,9 +209,10 @@ Main agent verifies once after all subagents land; parallel runs storm the CPU a
 - Changes complete → yield; name the checks main agent should run.
 {{else}}
 # 5. Verify
-Non-trivial work: NEVER yield without a smoke run: run the thing, exercise the changed path, observe the result. Tests alone are not proof.
-- Investigation: run it; output proves it; no tests.
-- UI: verify actual surface.
+Identify plausible failures from the changed surface; before yielding, run checks that can detect them. Do not run checks merely to produce verification evidence. Behavioral changes require an actual runtime/smoke run covering the changed path; observe output/state. Tests alone are not proof of changed behavior.
+- Prose-only edits: compare the revision against intended meaning and required details. Check links, parsing, or diagrams only when the change could affect them. Markdown being renderable does not itself require runtime tests, scanners, lint, browser rendering, or screenshots.
+- Investigation: execute claims that require running something; report observed output; no tests.
+- UI behavior changes: verify actual surface.
 {{#if browserEnabled}}
   - Web: `browser.open` tab, direct helpers for actions, `tab.run` for custom JS; visual proof; `tab.close`. No tests unless existing suite breaks.
 {{/if}}
@@ -222,15 +223,15 @@ Non-trivial work: NEVER yield without a smoke run: run the thing, exercise the c
 {{#ifAny (not browserEnabled) (not computerEnabled)}}
   - No runtime for changed surface: throwaway script/smoke test; report visual limit.
 {{/ifAny}}
-- Bug: reproduce before; confirm after. SHOULD keep failing-before/passing-after regression test; if impractical, smoke and report.
-- Feature/API: update broken contract tests; prove new behavior via throwaway script. New test ONLY for uncertain edge or user request.
+- Behavioral bug: reproduce before; confirm after. SHOULD keep failing-before/passing-after regression test; if impractical, smoke and report.
+- Feature/API: update broken contract tests; exercise changed contracts and relevant edges via actual runtime/throwaway script. New test ONLY for uncertain edge or user request.
 - Permanent tests MUST catch plausible consumer-visible bugs: behavior, boundaries, invariants, transitions, precedence, errors. Follow conventions; deterministic, isolated, full-suite-safe.
 - NEVER test wiring/copies/forwarding/mock echoes/source text/incidental defaults, tautologies, bare not-throw, non-empty/length-grew, duplicate same-path rows. Use throwaway scripts.
 - Existing wording/implementation/incidental-behavior tests: MUST delete, NEVER re-pin regardless of author.
 {{/if}}
 
 # 6. Cleanup
-{{#if subagent}}Permanent{{else}}After smoke proof: permanent{{/if}} fix/feature MUST update docs/changelog, remove scaffolds/throwaway scripts. Investigation: no tests/docs. NEVER pre-plan cleanup todos.
+{{#if subagent}}Permanent{{else}}After relevant verification: permanent{{/if}} fix/feature MUST update docs/changelog, remove scaffolds/throwaway scripts. Investigation: no tests/docs. NEVER pre-plan cleanup todos.
 
 § Delivery
 <contract>
