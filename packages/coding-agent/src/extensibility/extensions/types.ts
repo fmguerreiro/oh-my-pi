@@ -2086,6 +2086,22 @@ export interface ProviderConfig {
 		modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 	};
 	/**
+	 * Register this provider as externally managed, mutually exclusive with
+	 * `oauth`: an external CLI owns login, logout, and the credential itself.
+	 * `/login` runs `loginCommand` in the user's own terminal; auth status
+	 * comes from running `statusCommand` (exit 0 = authenticated) rather than
+	 * from any credential this process stores. No key or token is ever
+	 * persisted for the provider.
+	 */
+	externalLogin?: {
+		/** Display name in login UI. */
+		name: string;
+		/** Argv (never a shell string) run in the foreground to perform login. */
+		loginCommand: string[];
+		/** Argv (never a shell string) run to check auth status; exit 0 means authenticated. */
+		statusCommand: string[];
+	};
+	/**
 	 * Async factory that fetches the live model list from the provider endpoint.
 	 * Runs through the same SQLite model-cache as built-in providers (keyed by
 	 * provider name, default 24 h TTL). Receives the resolved API key (undefined

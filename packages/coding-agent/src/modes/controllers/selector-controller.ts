@@ -2,8 +2,10 @@ import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-p
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
 import type {
+	checkExternalLoginStatus as CheckExternalLoginStatus,
 	getOAuthCredentialProvider as GetOAuthCredentialProvider,
 	getOAuthProviders as GetOAuthProviders,
+	runExternalLoginCommand as RunExternalLoginCommand,
 } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -17,6 +19,7 @@ import {
 	getProjectDir,
 	logger,
 	normalizePathForComparison,
+	postmortem,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
 import {
@@ -161,6 +164,8 @@ interface ProviderAuthUiModules {
 	PASTE_CODE_LOGIN_PROVIDERS: typeof PasteCodeLoginProviders;
 	getOAuthProviders: typeof GetOAuthProviders;
 	getOAuthCredentialProvider: typeof GetOAuthCredentialProvider;
+	runExternalLoginCommand: typeof RunExternalLoginCommand;
+	checkExternalLoginStatus: typeof CheckExternalLoginStatus;
 	LoginDialogComponent: typeof LoginDialogComponentType;
 	LogoutAccountSelectorComponent: typeof LogoutAccountSelectorComponentType;
 	OAuthSelectorComponent: typeof OAuthSelectorComponentType;
@@ -172,6 +177,8 @@ function loadProviderAuthUi(): ProviderAuthUiModules {
 		PASTE_CODE_LOGIN_PROVIDERS: require("@oh-my-pi/pi-ai/index.js").PASTE_CODE_LOGIN_PROVIDERS,
 		getOAuthProviders: require("@oh-my-pi/pi-ai/registry/oauth/index.js").getOAuthProviders,
 		getOAuthCredentialProvider: require("@oh-my-pi/pi-ai/registry/oauth/index.js").getOAuthCredentialProvider,
+		runExternalLoginCommand: require("@oh-my-pi/pi-ai/registry/oauth/index.js").runExternalLoginCommand,
+		checkExternalLoginStatus: require("@oh-my-pi/pi-ai/registry/oauth/index.js").checkExternalLoginStatus,
 		LoginDialogComponent: require("@oh-my-pi/pi-tui/overlays/login-dialog.js").LoginDialogComponent,
 		LogoutAccountSelectorComponent: require("@oh-my-pi/pi-tui/overlays/logout-account-selector.js")
 			.LogoutAccountSelectorComponent,
@@ -2088,6 +2095,60 @@ export class SelectorController {
 	}
 
 	/**
+	 * Run `providerId`'s external `loginCommand` in the foreground, handing it
+	 * the real terminal (the TUI stops rendering for the duration), then check
+	 * its `statusCommand`. No credential is read or stored here — the status
+	 * check is the only truth. Returns true only when that check passes.
+	 */
+	async #handleExternalLogin(providerId: string, providerName: string): Promise<boolean> {
+		const { runExternalLoginCommand, checkExternalLoginStatus } = loadProviderAuthUi();
+		this.ctx.showStatus(`Running ${providerName} login in your terminal…`);
+		this.ctx.ui.requestRender();
+		const releaseSigint = postmortem.deferSigintToForegroundChild();
+		let exitCode: number | undefined;
+		try {
+			this.ctx.ui.stop();
+			exitCode = await runExternalLoginCommand(providerId);
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to run ${providerName} login command: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		} finally {
+			releaseSigint();
+			this.ctx.ui.start();
+			this.ctx.ui.requestRender();
+		}
+		if (exitCode === undefined) {
+			this.ctx.showError(`Unknown externally managed provider: ${providerId}`);
+			return false;
+		}
+		const authenticated = exitCode === 0 && (await checkExternalLoginStatus(providerId));
+		if (!authenticated) {
+			this.ctx.showWarning(
+				exitCode === 0
+					? `${providerName} login finished, but its status check did not confirm authentication.`
+					: `${providerName} login command exited with code ${exitCode}.`,
+			);
+			return false;
+		}
+		try {
+			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
+		} catch (error) {
+			logger.warn("Scoped model refresh after external login failed", { error: String(error) });
+		}
+		const block = new TranscriptBlock();
+		block.addChild(
+			new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerName}`), 1, 0),
+		);
+		block.addChild(
+			new Text(theme.fg("dim", `${providerName} manages its own credentials; this process stores none.`), 1, 0),
+		);
+		this.ctx.present(block);
+		return true;
+	}
+
+	/**
 	 * Run the OAuth login flow for `providerId` inside a cancellable
 	 * {@link LoginDialogComponent} that replaces the editor slot. Esc aborts:
 	 * the dialog's abort signal reaches the provider flow, any pending prompt
@@ -2095,6 +2156,11 @@ export class SelectorController {
 	 * credentials were stored.
 	 */
 	async #handleOAuthLogin(providerId: string): Promise<boolean> {
+		const { getOAuthProviders } = loadProviderAuthUi();
+		const knownProvider = getOAuthProviders().find(candidate => candidate.id === providerId);
+		if (knownProvider?.external) {
+			return this.#handleExternalLogin(providerId, knownProvider.name);
+		}
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const { getOAuthCredentialProvider, LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } = loadProviderAuthUi();
 		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
@@ -2279,7 +2345,7 @@ export class SelectorController {
 			return;
 		}
 
-		const { getOAuthProviders, OAuthSelectorComponent } = loadProviderAuthUi();
+		const { getOAuthProviders, OAuthSelectorComponent, checkExternalLoginStatus } = loadProviderAuthUi();
 		if (mode === "logout") {
 			await this.#refreshOAuthProviderAuthState();
 			const oauthProviders = getOAuthProviders();
@@ -2313,6 +2379,8 @@ export class SelectorController {
 				{
 					disabledProviders: cfgDisabledProviders.get(settings),
 					validateAuth: async (selectedProviderId: string) => {
+						const knownProvider = getOAuthProviders().find(candidate => candidate.id === selectedProviderId);
+						if (knownProvider?.external) return checkExternalLoginStatus(selectedProviderId);
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,
 							this.ctx.session.sessionId,

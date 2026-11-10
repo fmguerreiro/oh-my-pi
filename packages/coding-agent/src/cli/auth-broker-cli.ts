@@ -194,7 +194,8 @@ async function runLogin(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (flags.via && !flags.provider) {
 		throw new Error("Usage: omp auth-broker login <provider> --via=user@host (provider required for remote login)");
 	}
-	const providers = getOAuthProviders();
+	// An externally managed provider has no credential to broker — its own CLI owns the session.
+	const providers = getOAuthProviders().filter(p => !p.external);
 	// One interface for picker + login prompts; closed before `--via` hands
 	// stdin to ssh.
 	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -293,7 +294,7 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 }
 
 async function runList(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
-	const providers = getOAuthProviders();
+	const providers = getOAuthProviders().filter(p => !p.external);
 	if (flags.json) {
 		process.stdout.write(`${JSON.stringify(providers.map(p => ({ id: p.id, name: p.name })))}\n`);
 		return;

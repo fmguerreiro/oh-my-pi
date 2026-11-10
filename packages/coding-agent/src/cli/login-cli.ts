@@ -7,7 +7,7 @@
  * the next session sees the models the credential unlocked.
  */
 import * as readline from "node:readline";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai";
+import { checkExternalLoginStatus, getOAuthProviders, runExternalLoginCommand } from "@oh-my-pi/pi-ai";
 import { APP_NAME, getAgentDbPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
@@ -39,6 +39,27 @@ export async function runLoginCommand(provider: string | undefined): Promise<voi
 			throw new Error(`Unknown OAuth provider '${providerId}'. Run \`${APP_NAME} login\` to pick one.`);
 		}
 
+		if (info.external) {
+			rl.close();
+			process.stdout.write(`Running ${info.name} login: ${APP_NAME} hands off to its own command…\n`);
+			const exitCode = await runExternalLoginCommand(info.id);
+			const authenticated = exitCode === 0 && (await checkExternalLoginStatus(info.id));
+			if (!authenticated) {
+				process.stderr.write(
+					chalk.red(
+						exitCode === 0
+							? `Login failed: ${info.name} login finished, but its status check did not confirm authentication.\n`
+							: `Login failed: ${info.name} login command exited with code ${exitCode}.\n`,
+					),
+				);
+				process.exitCode = 1;
+				return;
+			}
+			await modelRegistry.refreshProvider(info.id, "online");
+			process.stdout.write(chalk.green(`\nLogged in to ${info.name}\n`));
+			process.stdout.write(chalk.dim(`${info.name} manages its own credentials; ${APP_NAME} stores none.\n`));
+			return;
+		}
 		const identity = await runTerminalOAuthLogin(rl, authStorage, info.id, { openBrowser: true });
 		if (!identity) {
 			process.stdout.write(chalk.yellow(`No credentials were stored for ${info.name}.\n`));

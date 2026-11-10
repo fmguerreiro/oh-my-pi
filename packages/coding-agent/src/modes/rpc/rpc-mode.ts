@@ -15,11 +15,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { checkExternalLoginStatus, getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { $env, APP_NAME, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -2711,14 +2711,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "get_login_providers": {
-				const providers = getOAuthProviders().map(provider => ({
-					id: provider.id,
-					name: provider.name,
-					available: provider.available,
-					authenticated:
-						session.modelRegistry.authStorage.keys.source(provider.storeCredentialsAs ?? provider.id) !==
-						undefined,
-				}));
+				const allProviders = getOAuthProviders();
+				const providers = await Promise.all(
+					allProviders.map(async provider => ({
+						id: provider.id,
+						name: provider.name,
+						available: provider.available,
+						authenticated: provider.external
+							? await checkExternalLoginStatus(provider.id)
+							: session.modelRegistry.authStorage.keys.source(provider.storeCredentialsAs ?? provider.id) !==
+								undefined,
+					})),
+				);
 				return success(id, "get_login_providers", { providers });
 			}
 
@@ -2726,6 +2730,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const knownProvider = getOAuthProviders().find(p => p.id === command.providerId);
 				if (!knownProvider) {
 					return error(id, "login", `Unknown OAuth provider: ${command.providerId}`);
+				}
+				if (knownProvider.external) {
+					return error(
+						id,
+						"login",
+						`Provider '${command.providerId}' is externally managed and requires an interactive terminal. ` +
+							`Run \`${APP_NAME} login ${command.providerId}\` from a terminal, or run its login command directly.`,
+					);
 				}
 				const uiCtx = new RpcExtensionUIContext(pendingExtensionRequests, output);
 				// Track whether onAuth has fired. Providers that require interactive

@@ -1,4 +1,5 @@
 import type { OAuthAccess } from "@oh-my-pi/pi-ai";
+import { EXTERNAL_LOGIN_SENTINEL } from "@oh-my-pi/pi-ai/oauth";
 import type { Api, Model } from "@oh-my-pi/pi-ai/types";
 import { authProviders } from "@oh-my-pi/pi-catalog/compat/auth";
 import type { ModelResolutionSource } from "@oh-my-pi/pi-catalog/model-manager";
@@ -28,11 +29,12 @@ export const STARTUP_MODEL_CACHE_PROVIDER_IDS: readonly string[] = Object.keys(S
 
 // Keyless-mode markers: each api-key login's KDL `empty-fallback` (e.g.
 // `lm-studio-local`), stored on an empty paste and never sent as a bearer.
-const LOCAL_PROVIDER_PLACEHOLDERS = new Set<string>(
-	authProviders().flatMap(entry =>
+const LOCAL_PROVIDER_PLACEHOLDERS = new Set<string>([
+	EXTERNAL_LOGIN_SENTINEL,
+	...authProviders().flatMap(entry =>
 		entry.login?.kind === "api-key" && entry.login.emptyFallback ? [entry.login.emptyFallback] : [],
 	),
-);
+]);
 
 /**
  * Hard bound for extension-provided fetchDynamicModels to prevent indefinite hangs

@@ -695,9 +695,24 @@ export async function fatal(error: unknown): Promise<never> {
 	return exitAfterFatal(report, "Fatal error", err, Reason.UNHANDLED_REJECTION);
 }
 
+let foregroundInterruptOwners = 0;
+
+/** Let a foreground child handle Ctrl+C without shutting down the parent session. */
+export function deferSigintToForegroundChild(): () => void {
+	foregroundInterruptOwners++;
+	let released = false;
+	return () => {
+		if (!released) {
+			released = true;
+			foregroundInterruptOwners--;
+		}
+	};
+}
+
 if (Bun.isMainThread) {
 	process
 		.on("SIGINT", async () => {
+			if (foregroundInterruptOwners > 0) return;
 			await runCleanup(Reason.SIGINT);
 			exitProcess(130); // 128 + SIGINT (2)
 		})

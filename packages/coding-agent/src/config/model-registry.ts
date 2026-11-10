@@ -2,7 +2,17 @@ import * as path from "node:path";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
 import { type AuthApiKeyOptions, type AuthPeekOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import {
+	checkExternalLoginStatus,
+	EXTERNAL_LOGIN_SENTINEL,
+	getExternalLoginProvider,
+	registerExternalLoginProvider,
+	registerOAuthProvider,
+	unregisterExternalLoginProvider,
+	unregisterExternalLoginProviders,
+	unregisterOAuthProvider,
+	unregisterOAuthProviders,
+} from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
@@ -326,6 +336,16 @@ export class ModelRegistry {
 	// re-materializes refreshed headers, not just the apiKey (#9760).
 	#commandConfigsByProvider: Map<string, Set<string>> = new Map();
 	#keylessProviders: Set<string> = new Set();
+	/** Providers registered with `externalLogin`: auth status comes only from their `statusCommand`. */
+	#externalLoginProviders: Set<string> = new Set();
+	/**
+	 * Last `checkExternalLoginStatus` result per externally-managed provider,
+	 * maintained by every async auth-resolution path. `hasConfiguredAuth`,
+	 * `hasConcreteAuth`, and provider availability must stay synchronous, so
+	 * they read this cache instead of spawning the status command themselves;
+	 * absent means "no check has run yet" and counts as unauthenticated.
+	 */
+	#externalLoginStatus: Map<string, boolean> = new Map();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
 	/**
 	 * Local providers registered without a models.yml entry (ollama, llama.cpp,
@@ -724,6 +744,9 @@ export class ModelRegistry {
 		// other explicit callers) pass refreshCommandCredentials to re-mint
 		// `!command` keys and headers for this provider.
 		this.#reloadStaticModelsForRefresh(options, providerId);
+		if (this.#externalLoginProviders.has(providerId)) {
+			await this.#refreshExternalLoginStatus(providerId);
+		}
 		for (const selector of this.#suppressedSelectors.keys()) {
 			if (selector.startsWith(`${providerId}/`)) {
 				this.#suppressedSelectors.delete(selector);
@@ -875,6 +898,16 @@ export class ModelRegistry {
 		return patched;
 	}
 
+	async #refreshExternalLoginStatus(provider: string, signal?: AbortSignal): Promise<boolean> {
+		const registration = getExternalLoginProvider(provider);
+		if (!registration || !this.#externalLoginProviders.has(provider)) return false;
+		const authenticated = await checkExternalLoginStatus(provider, { signal });
+		if (getExternalLoginProvider(provider) === registration && this.#externalLoginProviders.has(provider)) {
+			this.#externalLoginStatus.set(provider, authenticated);
+		}
+		return authenticated;
+	}
+
 	/**
 	 * Discover models for providers registered at runtime via `fetchDynamicModels`
 	 * (extension providers). Merges the discovered catalog into the existing model
@@ -885,6 +918,7 @@ export class ModelRegistry {
 	 * `online-if-uncached` strategy fetches at most once per cache TTL (24 h).
 	 */
 	async refreshRuntimeProviders(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+		await Promise.all([...this.#externalLoginProviders].map(provider => this.#refreshExternalLoginStatus(provider)));
 		if (this.#runtimeModelManagers.size === 0) {
 			return;
 		}
@@ -3050,9 +3084,11 @@ export class ModelRegistry {
 				// by `#keylessProviders`.
 				available =
 					!disabledProviders.has(provider) &&
-					(this.#keylessProviders.has(provider) ||
-						this.authStorage.keys.source(provider) !== undefined ||
-						this.authStorage.keys.keyless(provider));
+					(this.#externalLoginProviders.has(provider)
+						? this.#externalLoginStatus.get(provider) === true
+						: this.#keylessProviders.has(provider) ||
+							this.authStorage.keys.source(provider) !== undefined ||
+							this.authStorage.keys.keyless(provider));
 				byProvider.set(provider, available);
 			}
 			return available;
@@ -3116,6 +3152,9 @@ export class ModelRegistry {
 	 * ignores that alias so SuperGrok is not auto-selected from a paid key.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
+		if (this.#externalLoginProviders.has(model.provider)) {
+			return this.#externalLoginStatus.get(model.provider) === true;
+		}
 		const keyConfig = this.#customProviderApiKeys.get(model.provider);
 		return (
 			keyConfig !== undefined ||
@@ -3135,6 +3174,9 @@ export class ModelRegistry {
 	 * and issue #9967.
 	 */
 	hasConcreteAuth(provider: string): boolean {
+		if (this.#externalLoginProviders.has(provider)) {
+			return this.#externalLoginStatus.get(provider) === true;
+		}
 		const keyConfig = this.#customProviderApiKeys.get(provider);
 		return (
 			keyConfig !== undefined ||
@@ -3359,6 +3401,11 @@ export class ModelRegistry {
 	): Promise<ResolvedApiKey | undefined> {
 		if (this.#isProviderDisabled(provider)) return undefined;
 		if (options?.forceRefresh) this.#invalidateProviderCommandConfigs(provider);
+		if (this.#externalLoginProviders.has(provider)) {
+			// A stale config.apiKey placeholder must never override external status.
+			const authenticated = await this.#refreshExternalLoginStatus(provider, options?.signal);
+			return authenticated ? { apiKey: EXTERNAL_LOGIN_SENTINEL } : undefined;
+		}
 		if (this.#isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
@@ -3396,6 +3443,10 @@ export class ModelRegistry {
 	}
 
 	async #peekApiKeyForProvider(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
+		if (this.#externalLoginProviders.has(provider)) {
+			const authenticated = await this.#refreshExternalLoginStatus(provider);
+			return authenticated ? EXTERNAL_LOGIN_SENTINEL : undefined;
+		}
 		if (this.#keylessProviders.has(provider) && this.authStorage.keys.source(provider) === undefined) {
 			return kNoAuth;
 		}
@@ -3434,6 +3485,8 @@ export class ModelRegistry {
 		this.#invalidateProviderModelCache(providerName);
 		this.authStorage.keys.removeConfig(providerName);
 		this.authStorage.usage.removeProvider(providerName);
+		this.#externalLoginProviders.delete(providerName);
+		this.#externalLoginStatus.delete(providerName);
 	}
 
 	/**
@@ -3445,6 +3498,7 @@ export class ModelRegistry {
 		for (const sourceId of typeof sourceIds === "string" ? [sourceIds] : sourceIds) {
 			unregisterCustomApis(sourceId);
 			unregisterOAuthProviders(sourceId);
+			unregisterExternalLoginProviders(sourceId);
 			const sourceProviders = this.#runtimeProvidersBySource.get(sourceId);
 			if (!sourceProviders || sourceProviders.size === 0) {
 				continue;
@@ -3479,6 +3533,8 @@ export class ModelRegistry {
 			this.#runtimeProviderSourceByName.delete(providerName);
 		}
 		unregisterOAuthProvider(providerName);
+		unregisterExternalLoginProvider(providerName);
+		this.#externalLoginProviders.delete(providerName);
 		this.#ensureFullSnapshot();
 		this.#clearRuntimeProviderState(providerName);
 		this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
@@ -3508,6 +3564,20 @@ export class ModelRegistry {
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
+		if (config.oauth && config.externalLogin) {
+			throw new Error(`Provider ${providerName}: "oauth" and "externalLogin" are mutually exclusive.`);
+		}
+		if (config.externalLogin) {
+			if (!config.externalLogin.name) {
+				throw new Error(`Provider ${providerName}: externalLogin.name is required.`);
+			}
+			if (config.externalLogin.loginCommand.length === 0) {
+				throw new Error(`Provider ${providerName}: externalLogin.loginCommand must not be empty.`);
+			}
+			if (config.externalLogin.statusCommand.length === 0) {
+				throw new Error(`Provider ${providerName}: externalLogin.statusCommand must not be empty.`);
+			}
+		}
 
 		validateProviderConfiguration(
 			providerName,
@@ -3516,7 +3586,7 @@ export class ModelRegistry {
 				headers: config.headers,
 				apiKey: config.apiKey,
 				api: config.api,
-				oauthConfigured: Boolean(config.oauth),
+				oauthConfigured: Boolean(config.oauth) || Boolean(config.externalLogin),
 				models: (config.models ?? []) as ProviderValidationModel[],
 			},
 			"runtime-register",
@@ -3532,6 +3602,13 @@ export class ModelRegistry {
 		if (config.oauth) {
 			registerOAuthProvider({
 				...config.oauth,
+				id: providerName,
+				sourceId,
+			});
+		}
+		if (config.externalLogin) {
+			registerExternalLoginProvider({
+				...config.externalLogin,
 				id: providerName,
 				sourceId,
 			});
@@ -3558,6 +3635,9 @@ export class ModelRegistry {
 		if (sourceHandoff) {
 			this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
 		}
+		if (config.externalLogin) {
+			this.#externalLoginProviders.add(providerName);
+		}
 
 		// Extension usage providers override built-ins/configured resolvers for the
 		// provider lifetime. #clearRuntimeProviderState removes this override when
@@ -3565,7 +3645,7 @@ export class ModelRegistry {
 		if (config.usage) {
 			this.authStorage.usage.setProvider(providerName, config.usage, config.apiKey);
 		}
-		if (config.apiKey) {
+		if (config.apiKey && !config.externalLogin) {
 			// A provider that owns a /login flow must not let its default key
 			// reference shadow the credential that login stores. Its apiKey is
 			// typically an env-var name; unset, it resolves to its literal text
@@ -3809,6 +3889,12 @@ export interface ProviderConfigInput {
 		refreshToken?(credentials: OAuthCredentials): Promise<OAuthCredentials>;
 		getApiKey?(credentials: OAuthCredentials): string;
 		modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+	};
+	/** Mutually exclusive with `oauth`: an external CLI owns login, logout, and the credential itself. */
+	externalLogin?: {
+		name: string;
+		loginCommand: string[];
+		statusCommand: string[];
 	};
 	/**
 	 * Async factory that fetches the live model list from the provider endpoint.

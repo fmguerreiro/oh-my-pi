@@ -213,7 +213,42 @@ distinct from the built-in one so processes without the extension (older session
 
 Extension-registered providers (`registerProvider`) can supply `fetchDynamicModels` for runtime model discovery; these fetches are hard-bounded to a 15-second timeout (`RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS` in `model-provider-discovery.ts`) so a hung endpoint cannot stall discovery.
 
-A provider's `apiKey` (a literal key or an environment variable name) normally overrides any stored OAuth or `/login` credential for that provider. When the registration also supplies `oauth`, `apiKey` becomes a fallback instead: the key the user saved with `/login` wins, and `apiKey` is used only when no stored login credential exists. This keeps an unset env-var name from being sent as the literal key. Registering a built-in provider id with both `oauth` and a gateway `apiKey` therefore lets a stored upstream credential take precedence over the gateway key.
+A provider's `apiKey` (a literal key or an environment variable name) normally overrides any stored OAuth or `/login` credential for that provider. When the registration also supplies `oauth`, `apiKey` becomes a fallback instead: the key the user saved with `/login` wins, and `apiKey` is used only when no stored login credential exists. This keeps an unset env-var name from being sent as the literal key. Registering a built-in provider id with both `oauth` and a gateway `apiKey` therefore lets a stored upstream credential take precedence over the gateway key. A registration that supplies `externalLogin` ignores `apiKey` entirely — see below.
+
+### Externally managed login
+
+`externalLogin` registers a provider whose login, logout, and credential are owned
+entirely by an external CLI — mutually exclusive with `oauth`. No key or token is
+ever stored for the provider by this process.
+
+```ts
+pi.registerProvider("my-external-cli", {
+  baseUrl: "http://127.0.0.1:4567",
+  api: "openai-completions",
+  externalLogin: {
+    name: "My External CLI",
+    loginCommand: ["my-cli", "login"],
+    statusCommand: ["my-cli", "auth", "status"],
+  },
+});
+```
+
+`/login` and `omp login` run `loginCommand` in the foreground, handing it the real
+terminal (the TUI suspends rendering for the duration in-session); `statusCommand`'s
+exit code — 0 for authenticated, nonzero otherwise — is the only source of truth for
+whether the provider is authenticated. It is checked fresh (spawning
+`statusCommand`) on every login attempt and every request-time credential
+resolution (`getApiKeyForProvider`); that result is cached and is what the
+synchronous model-availability probes (`hasConfiguredAuth`, `hasConcreteAuth`,
+the model picker) read, since they cannot spawn a process themselves — a
+provider with no prior check reads as not authenticated until one runs. A
+status check that errors, that doesn't finish within 10 seconds, or whose
+child ignores the resulting SIGTERM for 2 more seconds (then SIGKILL'd), all
+count as not authenticated. `/logout` and `omp auth-broker` do not run
+anything for an externally managed provider: there is no stored credential to
+remove, and the broker has nothing to hold. RPC clients get an explicit error
+from `login` naming the provider as externally managed, since there is no
+terminal to hand the login command.
 
 Provider login callbacks can request masked entry with
 `callbacks.onPrompt({ message: "Consumer key", secret: true })`. Native `/login`

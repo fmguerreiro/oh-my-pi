@@ -64,6 +64,8 @@ export class OAuthSelectorComponent extends OverlayPanel {
 	#maxVisible = OAUTH_SELECTOR_MAX_VISIBLE;
 	#mode: "login" | "logout";
 	#authStorage: OAuthSelectorAuthSource;
+	/** Providers whose credential lives entirely outside this process (see {@link OAuthProviderInfo.external}); their status is checked, never read from stored keys. */
+	#externalProviderIds: ReadonlySet<string> = new Set();
 	#onSelectCallback: (providerId: string) => void;
 	#onCancelCallback: () => void;
 	#statusMessage: string | undefined;
@@ -98,6 +100,11 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		this.#onCancelCallback = onCancel;
 		this.#validateAuthCallback = options?.validateAuth;
 		this.#requestRenderCallback = options?.requestRender;
+		this.#externalProviderIds = new Set(
+			getOAuthProviders()
+				.filter(provider => provider.external)
+				.map(provider => provider.id),
+		);
 		this.#menu = new MenuSelection<OAuthProviderInfo>([], {
 			getKey: provider => provider.id,
 			getSearchText: provider => this.#getProviderSearchText(provider),
@@ -134,10 +141,16 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		this.#maxVisible = rows;
 		this.#updateList();
 	}
-	#hasSelectableAuth(providerId: string): boolean {
+	/** True when a credential for `providerId` is actually held (stored key, or stored credential in logout mode). Never true for an external provider: its only truth is {@link #validateAuthCallback}. */
+	#hasStoredAuth(providerId: string): boolean {
 		return this.#mode === "logout"
 			? this.#authStorage.credentials.has(providerId)
 			: this.#authStorage.keys.source(providerId) !== undefined;
+	}
+
+	/** Validation-eligible: a stored credential, or an externally managed provider whose status is only known by checking. */
+	#hasSelectableAuth(providerId: string): boolean {
+		return this.#hasStoredAuth(providerId) || (this.#mode === "login" && this.#externalProviderIds.has(providerId));
 	}
 
 	#loadProviders(disabledProviders: readonly string[] = []): void {
@@ -258,9 +271,7 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		if (state === "valid") {
 			return theme.fg("success", ` ${theme.status.enabled} logged in`) + source;
 		}
-		return this.#hasSelectableAuth(providerId)
-			? theme.fg("success", ` ${theme.status.enabled} logged in`) + source
-			: "";
+		return this.#hasStoredAuth(providerId) ? theme.fg("success", ` ${theme.status.enabled} logged in`) + source : "";
 	}
 
 	#isSearchEnabled(): boolean {
@@ -453,7 +464,7 @@ export class OAuthSelectorComponent extends OverlayPanel {
 		const state = this.#authState.get(providerId);
 		if (state === "checking") return { value: [span("checking", "warning", { fx: "pulse" })], detail };
 		if (state === "invalid") return { value: [span("invalid", "error")], detail };
-		if (state === "valid" || this.#hasSelectableAuth(providerId)) {
+		if (state === "valid" || this.#hasStoredAuth(providerId)) {
 			return { value: [span("logged in", "success")], detail };
 		}
 		return { detail };
@@ -468,7 +479,7 @@ export class OAuthSelectorComponent extends OverlayPanel {
 				? "pending"
 				: state === "invalid"
 					? "error"
-					: state === "valid" || this.#hasSelectableAuth(provider.id)
+					: state === "valid" || this.#hasStoredAuth(provider.id)
 						? "success"
 						: "muted";
 		const source = origin
@@ -477,7 +488,11 @@ export class OAuthSelectorComponent extends OverlayPanel {
 				: ORIGIN_LABELS[origin.kind]
 			: undefined;
 		const detail = !source
-			? "Not configured"
+			? this.#externalProviderIds.has(provider.id)
+				? state === "valid"
+					? "Signed in · external"
+					: "Not signed in · external"
+				: "Not configured"
 			: origin?.kind === "oauth"
 				? `Signed in · ${source}`
 				: `API key · ${source}`;

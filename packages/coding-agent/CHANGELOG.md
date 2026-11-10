@@ -5,6 +5,7 @@
 ### Added
 
 - Startup update notices now show a summary of every newer coding-agent release and link to their changes.
+- `pi.registerProvider` accepts an `externalLogin` config (mutually exclusive with `oauth`) for providers whose login and credential are owned by an external CLI: `/login` and `omp login` run `loginCommand` in the foreground and trust only `statusCommand`'s exit code, never storing a credential of their own; `omp auth-broker` and `/logout` skip these providers since there is nothing to broker or remove.
 
 ### Fixed
 

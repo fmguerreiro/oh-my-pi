@@ -1,6 +1,10 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import type { TspKind, TspPickerProps } from "@oh-my-pi/pi-wire";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import {
+	getOAuthProviders,
+	registerExternalLoginProvider,
+	unregisterExternalLoginProvider,
+} from "@oh-my-pi/pi-ai/oauth";
 import type { DescribeContext, NativeNode } from "../src/native/node";
 import { HookSelectorComponent } from "../src/overlays/hook-selector";
 import { OAuthSelectorComponent, type OAuthSelectorAuthSource } from "../src/overlays/oauth-selector";
@@ -255,5 +259,85 @@ describe("oauth selector picker", () => {
 		selector.handleNativeEvent(at("activate", target));
 		selector.handleNativeEvent(act("close"));
 		expect(log).toEqual([target, "cancel"]);
+	});
+});
+
+describe("oauth selector picker: externally managed provider", () => {
+	const EXTERNAL_ID = "native-test-external-provider";
+	const externalAuth: OAuthSelectorAuthSource = {
+		credentials: { has: () => false },
+		keys: { source: () => undefined },
+	};
+
+	afterEach(() => {
+		unregisterExternalLoginProvider(EXTERNAL_ID);
+	});
+
+	it("shows no status until a check runs, never 'logged in' just because no key is stored", () => {
+		registerExternalLoginProvider({
+			id: EXTERNAL_ID,
+			name: "Native Test External",
+			loginCommand: ["true"],
+			statusCommand: ["true"],
+		});
+		const selector = new OAuthSelectorComponent(
+			"login",
+			externalAuth,
+			() => {},
+			() => {},
+		);
+		const row = sheet(selector.describe(pickerCx)).props.items?.find(item => item.id === EXTERNAL_ID);
+		expect(row?.dot).toBe("muted");
+	});
+
+	it("reflects the status check's result once it settles: valid shows success, invalid does not", async () => {
+		registerExternalLoginProvider({
+			id: EXTERNAL_ID,
+			name: "Native Test External",
+			loginCommand: ["true"],
+			statusCommand: ["true"],
+		});
+		const checked: string[] = [];
+		const selector = new OAuthSelectorComponent(
+			"login",
+			externalAuth,
+			() => {},
+			() => {},
+			{
+				validateAuth: async (id: string) => {
+					checked.push(id);
+					return id === EXTERNAL_ID;
+				},
+			},
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(checked).toContain(EXTERNAL_ID);
+		const row = sheet(selector.describe(pickerCx)).props.items?.find(item => item.id === EXTERNAL_ID);
+		expect(row?.dot).toBe("success");
+		selector.stopValidation();
+	});
+
+	it("an external provider whose check fails is never shown as logged in", async () => {
+		registerExternalLoginProvider({
+			id: EXTERNAL_ID,
+			name: "Native Test External",
+			loginCommand: ["true"],
+			statusCommand: ["true"],
+		});
+		const selector = new OAuthSelectorComponent(
+			"login",
+			externalAuth,
+			() => {},
+			() => {},
+			{
+				validateAuth: async () => false,
+			},
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		const row = sheet(selector.describe(pickerCx)).props.items?.find(item => item.id === EXTERNAL_ID);
+		expect(row?.dot).toBe("error");
+		selector.stopValidation();
 	});
 });

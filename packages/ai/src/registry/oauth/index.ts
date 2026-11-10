@@ -7,6 +7,7 @@ import * as AIError from "../../error";
 import { jwtExpiryMs, NEVER_EXPIRES } from "../engine/common";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "../registry";
 import type {
+	ExternalLoginProviderInterface,
 	OAuthCredentials,
 	OAuthProvider,
 	OAuthProviderId,
@@ -58,6 +59,92 @@ export function unregisterOAuthProviders(sourceId: string): void {
 		if (provider.sourceId === sourceId) {
 			customOAuthProviders.delete(id);
 		}
+	}
+}
+
+const customExternalLoginProviders = new Map<string, ExternalLoginProviderInterface>();
+
+/** Bearer value model streaming can ignore: an externally managed provider's own CLI/daemon holds the credential. */
+export const EXTERNAL_LOGIN_SENTINEL = "<externally-managed>";
+
+const EXTERNAL_LOGIN_STATUS_TIMEOUT_MS = 10_000;
+
+const EXTERNAL_LOGIN_STATUS_FORCE_KILL_GRACE_MS = 2_000;
+
+/** External providers own their credentials; status is checked through their CLI. */
+export function registerExternalLoginProvider(provider: ExternalLoginProviderInterface): void {
+	customExternalLoginProviders.set(provider.id, provider);
+}
+
+export function unregisterExternalLoginProvider(id: string): void {
+	customExternalLoginProviders.delete(id);
+}
+
+export function unregisterExternalLoginProviders(sourceId: string): void {
+	for (const [id, provider] of customExternalLoginProviders.entries()) {
+		if (provider.sourceId === sourceId) {
+			customExternalLoginProviders.delete(id);
+		}
+	}
+}
+
+export function getExternalLoginProvider(id: string): ExternalLoginProviderInterface | undefined {
+	return customExternalLoginProviders.get(id);
+}
+
+/** Callers must suspend their terminal UI while the login command runs. */
+export async function runExternalLoginCommand(id: string): Promise<number | undefined> {
+	const provider = customExternalLoginProviders.get(id);
+	if (!provider || provider.loginCommand.length === 0) return undefined;
+	const child = Bun.spawn([...provider.loginCommand], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	return child.exited;
+}
+
+/** Discard status output because it may contain private account details. */
+export async function checkExternalLoginStatus(
+	id: string,
+	options?: { timeoutMs?: number; signal?: AbortSignal },
+): Promise<boolean> {
+	const provider = customExternalLoginProviders.get(id);
+	if (!provider || provider.statusCommand.length === 0) return false;
+	if (options?.signal?.aborted) return false;
+	let child: ReturnType<typeof Bun.spawn> | undefined;
+	try {
+		child = Bun.spawn([...provider.statusCommand], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+	} catch {
+		return false;
+	}
+	const timeoutMs = options?.timeoutMs ?? EXTERNAL_LOGIN_STATUS_TIMEOUT_MS;
+	let timedOutOrAborted = false;
+	const kill = (): void => {
+		timedOutOrAborted = true;
+		try {
+			child?.kill();
+		} catch {
+			// Already exited.
+		}
+	};
+	const forceKill = (): void => {
+		timedOutOrAborted = true;
+		try {
+			child?.kill("SIGKILL");
+		} catch {
+			// Already exited.
+		}
+	};
+	const softTimer = setTimeout(kill, timeoutMs);
+	const hardTimer = setTimeout(forceKill, timeoutMs + EXTERNAL_LOGIN_STATUS_FORCE_KILL_GRACE_MS);
+	const onAbort = (): void => forceKill();
+	options?.signal?.addEventListener("abort", onAbort);
+	try {
+		const exitCode = await child.exited;
+		return !timedOutOrAborted && exitCode === 0;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(softTimer);
+		clearTimeout(hardTimer);
+		options?.signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -164,7 +251,13 @@ export function getOAuthProviders(): OAuthProviderInfo[] {
 		available: true,
 		storeCredentialsAs: provider.storeCredentialsAs,
 	}));
-	return [...builtInOAuthProviders, ...customProviders];
+	const externalProviders = Array.from(customExternalLoginProviders.values(), provider => ({
+		id: provider.id,
+		name: provider.name,
+		available: true,
+		external: true as const,
+	}));
+	return [...builtInOAuthProviders, ...customProviders, ...externalProviders];
 }
 
 /** Provider id that stores `providerId`'s credentials: login aliases (`openai-codex-device`) map to their target (`openai-codex`). */

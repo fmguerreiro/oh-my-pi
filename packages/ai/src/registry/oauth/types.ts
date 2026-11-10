@@ -80,6 +80,19 @@ export interface OAuthProviderInfo {
 	 * entry back to the model provider it authenticates.
 	 */
 	storeCredentialsAs?: string;
+	/** The external CLI owns credentials and reports authentication status. */
+	external?: boolean;
+}
+
+/** Config for a provider registered via `externalLogin`: an external CLI owns the credential. */
+export interface ExternalLoginProviderInterface {
+	readonly id: string;
+	readonly name: string;
+	readonly sourceId?: string;
+	/** Argv run in the foreground, inheriting the user's terminal, to perform the login. */
+	readonly loginCommand: readonly string[];
+	/** Argv run to check auth status; exit code 0 means authenticated. */
+	readonly statusCommand: readonly string[];
 }
 
 /** Sign-in URL and accepted cookies for an isolated, host-owned browser. */
