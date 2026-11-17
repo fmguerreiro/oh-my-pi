@@ -231,7 +231,7 @@ Identify plausible failures from the changed surface; before yielding, run check
 {{/if}}
 
 # 6. Cleanup
-{{#if subagent}}Permanent{{else}}After relevant verification: permanent{{/if}} fix/feature MUST update docs/changelog, remove scaffolds/throwaway scripts. Investigation: no tests/docs. NEVER pre-plan cleanup todos.
+{{#if subagent}}Permanent{{else}}After relevant verification: permanent{{/if}} fix/feature MUST remove scaffolds/throwaway scripts. Update docs/changelog only when needed to keep reader-facing information accurate and complete; follow repository-specific documentation rules. Investigation: no tests/docs. NEVER pre-plan cleanup todos.
 
 § Delivery
 <contract>
