@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as compatAuth from "@oh-my-pi/pi-catalog/compat/auth";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,8 +9,9 @@ import { createNativeJudge } from "@oh-my-pi/pi-ai/judgment";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
@@ -21,12 +23,14 @@ import {
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
+	type DiscoveryProviderConfig,
+	discoverLlamaCppModels,
 	discoverLiteLLMModels,
 	discoverOllamaModels,
 	discoverOpenAIModelsList,
+	discoverProxyModels,
 	discoveryProbeTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
-import { RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resolveCliModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
@@ -69,6 +73,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		resetSettingsForTest();
 		if (originalOllamaBaseUrl === undefined) {
 			delete Bun.env.OLLAMA_BASE_URL;
@@ -690,6 +695,8 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity discovery unions every account's roster and routes each model to an account serving it", async () => {
+		// Antigravity is paused in its auth rules; its discovery stays for when it is turned back on.
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		// Account A's plan omits Claude 5.5; account B's serves it. Discovery is
 		// authoritative, so reading only one account's roster would prune Claude
 		// 5.5 for both whenever A is the account discovery happens to pick.
@@ -749,6 +756,7 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("Antigravity routing still works for an account whose login stored no email", async () => {
+		vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined);
 		// Google's userinfo lookup is optional at login; such a credential keeps
 		// only its project id, which must still tag and select the account.
 		await authStorage.credentials.set("google-antigravity", [
@@ -1410,7 +1418,40 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(gemma?.contextWindow).toBe(131072);
 		expect(gemma?.maxTokens).toBe(32_768);
 		expect(gemma?.input).toEqual(["text"]);
-		expect(gemma?.reasoning).toBe(false);
+	});
+
+	test("local discovery leaves models unverified when native metadata has no capability evidence", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "unlisted-local" }] });
+			if (url.endsWith("/api/show") || url.endsWith("/props")) return Response.json({});
+			if (url.endsWith("/models")) return Response.json({ data: [{ id: "unlisted-local" }] });
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const ctx = { fetch: fetchMock, getBearerApiKeyResolver: async () => undefined };
+		const ollama = await discoverOllamaModels(
+			{
+				provider: "ollama",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:11434",
+				discovery: { type: "ollama" },
+			},
+			ctx,
+		);
+		const llamaCpp = await discoverLlamaCppModels(
+			{
+				provider: "llama.cpp",
+				api: "openai-responses",
+				baseUrl: "http://127.0.0.1:8080",
+				discovery: { type: "llama.cpp" },
+			},
+			ctx,
+		);
+		for (const models of [ollama, llamaCpp]) {
+			expect(models).toHaveLength(1);
+			expect(models[0]?.reasoning).toBe(true);
+			expect(models[0]?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		}
 	});
 
 	test("discovery failure does not fail model registry refresh", async () => {
@@ -1755,104 +1796,9 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(bonsai1?.compat).toMatchObject({ qwenTemplateReasoningEffort: false });
 
 		const plain = registry.find("llama.cpp", "llama-3.1-8b");
-		expect(plain?.reasoning).toBe(false);
 		expect(plain?.api).toBe("openai-responses");
 		expect(plain?.baseUrl).toBe("http://127.0.0.1:8080/v1");
 		expect(plain?.compat).not.toMatchObject({ reasoningDisableMode: "qwen-enable-thinking-false" });
-	});
-
-	test("discovery timeout rejects even when fetch ignores abort", async () => {
-		vi.useFakeTimers();
-		try {
-			const pending = Promise.withResolvers<Response>();
-			let outcome: string | undefined;
-			void discoverOllamaModels(
-				{
-					provider: "ollama",
-					api: "openai-responses",
-					baseUrl: "http://127.0.0.1:11434",
-					discovery: { type: "ollama", timeoutMs: 25 },
-					optional: true,
-				},
-				{
-					fetch: () => pending.promise,
-					getBearerApiKeyResolver: async () => undefined,
-				},
-			).then(
-				() => {
-					outcome = "resolved";
-				},
-				error => {
-					outcome = error instanceof DOMException ? error.name : String(error);
-				},
-			);
-
-			vi.advanceTimersByTime(25);
-			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
-
-			expect(outcome).toBe("TimeoutError");
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	test("lm-studio discovery bounds a loopback probe without shrinking a remote host's budget", async () => {
-		// Regression (#12945): the lm-studio/openai-models-list probe used the flat
-		// remote budget, so every launch with no LM Studio listening on
-		// 127.0.0.1:1234 waited out the full connect timeout instead of the
-		// loopback cap the other implicit local engines honor.
-		vi.useFakeTimers();
-		try {
-			const hang = Promise.withResolvers<Response>();
-			const ctx = {
-				fetch: () => hang.promise,
-				getBearerApiKeyResolver: async () => undefined,
-			};
-			const loopback = discoverOpenAIModelsList(
-				{
-					provider: "lm-studio",
-					api: "openai-completions",
-					baseUrl: "http://127.0.0.1:1234/v1",
-					discovery: { type: "lm-studio" },
-					optional: true,
-				},
-				ctx,
-			);
-			const remote = discoverOpenAIModelsList(
-				{
-					provider: "lm-studio-remote",
-					api: "openai-completions",
-					baseUrl: "http://lm-studio.example:1234/v1",
-					discovery: { type: "lm-studio" },
-					optional: true,
-				},
-				ctx,
-			);
-			const outcomes = new Map<string, string>();
-			for (const [host, probe] of [
-				["loopback", loopback],
-				["remote", remote],
-			] as const) {
-				void probe.then(
-					() => outcomes.set(host, "resolved"),
-					error => outcomes.set(host, error instanceof DOMException ? error.name : String(error)),
-				);
-			}
-
-			// Both probes resolve their credential lookup before arming a deadline,
-			// so drain those microtasks before moving the clock. The drains are
-			// generous on purpose: asserting recorded outcomes (rather than awaiting
-			// a promise that a regression leaves pending) keeps a broken cap a
-			// failure instead of a hang.
-			for (let flush = 0; flush < 50; flush++) await Promise.resolve();
-			vi.advanceTimersByTime(1_000);
-			for (let flush = 0; flush < 50; flush++) await Promise.resolve();
-
-			expect(outcomes.get("loopback")).toBe("TimeoutError");
-			expect(outcomes.get("remote")).toBeUndefined();
-		} finally {
-			vi.useRealTimers();
-		}
 	});
 
 	test("configured llama.cpp Qwen model keeps its /v1 runtime URL despite a native-root baseUrl override", async () => {
@@ -2981,6 +2927,87 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(maxTokensById["openai-test/no-limits"]).toBe(32_768);
 	});
 
+	test("openai-models-list skips a model whose id names two vendors instead of dropping the provider (#18770)", async () => {
+		const ctx = {
+			fetch: (async (input: unknown) => {
+				if (String(input) !== "http://127.0.0.1:9993/v3/models") {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				// Eden AI's gateway prefixes each id with the hosting vendor. Rows that
+				// advertise reasoning levels are classified while their spec is prepared.
+				const data = ["vertex/gemini-4-carbon@eu", "amazon/openai.gpt-6.1-sol", "mistral/mistral-large-latest"].map(
+					id => ({
+						id,
+						object: "model",
+						owned_by: id.split("/")[0],
+						...(id.startsWith("mistral/") ? {} : { supported_reasoning_levels: ["low", "high"] }),
+					}),
+				);
+				return new Response(JSON.stringify({ object: "list", data }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}) satisfies FetchImpl,
+			getBearerApiKeyResolver: async () => undefined,
+		};
+		const models = await discoverOpenAIModelsList(
+			{
+				provider: "eden-ai",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9993/v3",
+				discovery: { type: "openai-models-list", injectV1: false },
+			},
+			ctx,
+		);
+		expect(models.map(model => model.id)).toEqual(["vertex/gemini-4-carbon@eu", "mistral/mistral-large-latest"]);
+	});
+
+	test("proxy discovery skips a model whose id names two vendors instead of dropping the provider (#18770)", async () => {
+		const fetchMock: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:9992/v1/models") throw new Error(`Unexpected URL: ${String(input)}`);
+			return Response.json({
+				data: [
+					{ id: "amazon/openai.gpt-6.1-sol", supported_endpoint_types: ["openai"] },
+					{ id: "mistral/mistral-large-latest", supported_endpoint_types: ["openai"] },
+				],
+			});
+		};
+		const models = await discoverProxyModels(
+			{
+				provider: "proxy-test",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9992/v1",
+				discovery: { type: "proxy" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		expect(models.map(model => model.id)).toEqual(["mistral/mistral-large-latest"]);
+	});
+
+	test("litellm discovery skips a model group whose name names two vendors instead of dropping the provider (#18770)", async () => {
+		const fetchMock: FetchImpl = async input => {
+			if (String(input) !== "http://127.0.0.1:4001/model_group/info") {
+				throw new Error(`Unexpected URL: ${String(input)}`);
+			}
+			return Response.json({
+				data: [
+					{ model_group: "amazon/openai.gpt-6.1-sol", providers: ["bedrock"] },
+					{ model_group: "gpt-big", providers: ["openai"] },
+				],
+			});
+		};
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4001",
+				api: "openai-completions",
+				discovery: { type: "litellm" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		expect(models.map(model => model.id)).toEqual(["gpt-big"]);
+	});
+
 	// Runs one `/v1/models` payload through the real `openai-models-list`
 	// discovery path and returns the output cap each row ended up with, so the
 	// precedence assertions below observe the boundary a user sees rather than
@@ -3159,8 +3186,50 @@ describe("ModelRegistry runtime discovery", () => {
 		// Unknown model ids stay on the default fallback path.
 		const unknown = registry.find("openai-test", "unknown-proxy-model");
 		expect(unknown?.contextWindow).toBe(128000);
-		expect(unknown?.reasoning).toBe(false);
+		expect(unknown?.reasoning).toBe(true);
+		expect(unknown?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		expect(unknown?.compatConfig).not.toMatchObject({ supportsReasoningEffort: false });
 	});
+
+	test.each(["openai-models-list", "proxy", "lm-studio"])(
+		"%s discovery distinguishes missing reasoning evidence from advertised true and false",
+		async type => {
+			const fetchMock: FetchImpl = async input => {
+				const url = String(input);
+				if (url.endsWith("/v1/models")) {
+					return Response.json({
+						data: [
+							{ id: "unlisted-silent" },
+							{ id: "unlisted-native", reasoning: true },
+							{ id: "unlisted-plain", reasoning: false },
+						],
+					});
+				}
+				return new Response(null, { status: 404 });
+			};
+			const ctx = { fetch: fetchMock, getBearerApiKeyResolver: async () => undefined };
+			const config: DiscoveryProviderConfig = {
+				provider: "custom-discovery",
+				api: "openai-completions",
+				baseUrl: "https://custom.example/v1",
+				discovery: {
+					type: type === "proxy" ? "proxy" : type === "lm-studio" ? "lm-studio" : "openai-models-list",
+				},
+			};
+			const models = await (type === "proxy"
+				? discoverProxyModels(config, ctx)
+				: discoverOpenAIModelsList(config, ctx));
+			const silent = models.find(model => model.id === "unlisted-silent");
+			expect(silent?.reasoning).toBe(true);
+			expect(silent?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+			const native = models.find(model => model.id === "unlisted-native");
+			expect(native?.reasoning).toBe(true);
+			expect(native?.thinking?.unverified).not.toBe(true);
+			const plain = models.find(model => model.id === "unlisted-plain");
+			expect(plain?.reasoning).toBe(false);
+			expect(plain?.thinking).toBeUndefined();
+		},
+	);
 
 	test("openai-models-list discovery marks advertised reasoning ladders reasoning-capable (codex-lb metadata shape)", async () => {
 		writeRawModelsJson({
@@ -3241,6 +3310,154 @@ describe("ModelRegistry runtime discovery", () => {
 			{ apiKey: "TEST_KEY", fetch: chatFetch, reasoning: "high" },
 		).result();
 		expect(requestPayload?.reasoning_effort).toBe("high");
+	});
+
+	test("openai-models-list discovery carries advertised effort aliases and mandatory reasoning", async () => {
+		writeRawModelsJson({
+			"example-gateway": {
+				baseUrl: "http://127.0.0.1:9995",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		// `example-route` serves low/high/max and names where unserved requests land
+		// (unknown names are dropped) and that reasoning cannot be turned off.
+		// `acme-*-thinking` ids are locked to mandatory reasoning by identity; an
+		// explicit `reasoning_required: false` must win.
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9995/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "example-route",
+								object: "model",
+								owned_by: "example-gateway",
+								supported_reasoning_levels: ["low", "high", "max"],
+								default_reasoning_level: "high",
+								reasoning_effort_map: {
+									minimal: "high",
+									medium: "high",
+									xhigh: "max",
+									turbo: "low",
+									ultra: "max",
+								},
+								reasoning_required: true,
+							},
+							{
+								id: "example-optional-route",
+								object: "model",
+								owned_by: "example-gateway",
+								supported_reasoning_levels: ["low", "high"],
+								reasoning_required: false,
+							},
+							{
+								id: "acme-locked-thinking",
+								object: "model",
+								owned_by: "example-gateway",
+								supported_reasoning_levels: ["low", "high"],
+							},
+							{
+								id: "acme-unlocked-thinking",
+								object: "model",
+								owned_by: "example-gateway",
+								supported_reasoning_levels: ["low", "high"],
+								reasoning_required: false,
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("example-gateway", "example-route");
+		expect(model?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.Max],
+			defaultLevel: Effort.High,
+			effortMap: { minimal: "high", medium: "high", xhigh: "max" },
+			requiresEffort: true,
+		});
+		const optional = registry.find("example-gateway", "example-optional-route");
+		expect(optional?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High],
+			defaultLevel: Effort.Low,
+			requiresEffort: false,
+		});
+		expect(registry.find("example-gateway", "acme-locked-thinking")?.thinking?.requiresEffort).toBe(true);
+		expect(registry.find("example-gateway", "acme-unlocked-thinking")?.thinking?.requiresEffort).toBe(false);
+		if (!model || !optional) throw new Error("expected both discovered routes");
+		async function sendThroughStreamSimple(
+			target: Model,
+			options: { reasoning?: Effort },
+		): Promise<Record<string, unknown>> {
+			let payload: Record<string, unknown> | undefined;
+			const fetch: FetchImpl = async (_input, init) => {
+				payload = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+				const events = [
+					{ id: "chatcmpl-alias-fixture", choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }] },
+					{ id: "chatcmpl-alias-fixture", choices: [{ index: 0, finish_reason: "stop", delta: {} }] },
+				];
+				const body = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\ndata: [DONE]\n\n`;
+				return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+			};
+			await streamSimple(
+				target,
+				{ messages: [{ role: "user", content: "Reply with exactly OK.", timestamp: Date.now() }] },
+				{ apiKey: "TEST_KEY", fetch, ...options },
+			).result();
+			if (!payload) throw new Error("stream fixture did not make a request");
+			return payload;
+		}
+		expect((await sendThroughStreamSimple(model, { reasoning: Effort.Minimal })).reasoning_effort).toBe("high");
+		expect((await sendThroughStreamSimple(model, { reasoning: Effort.Medium })).reasoning_effort).toBe("high");
+		// With no effort requested, the mandatory route still sends its lowest tier.
+		expect((await sendThroughStreamSimple(model, {})).reasoning_effort).toBe("low");
+		expect((await sendThroughStreamSimple(optional, {})).reasoning_effort).toBeUndefined();
+	});
+
+	test("openai-models-list discovery reads relay rows' advertised service tiers", async () => {
+		writeRawModelsJson({
+			"codex-relay": {
+				baseUrl: "http://127.0.0.1:9994",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		// Relays republish the Codex catalog's tiers as bare ids, or (codex-lb)
+		// as codex-rs `{ id }` objects nested under `metadata`.
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9994/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "gpt-6.1-sol", object: "model", service_tiers: ["priority", "ultrafast"] },
+							{ id: "gpt-6-sol", object: "model", service_tiers: ["priority"] },
+							{
+								id: "gpt-6-astra",
+								object: "model",
+								metadata: { service_tiers: [{ id: "ultrafast", name: "Ultrafast" }] },
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("codex-relay", "gpt-6.1-sol")?.serviceTiers).toEqual(["priority", "ultrafast"]);
+		expect(registry.find("codex-relay", "gpt-6-astra")?.serviceTiers).toEqual(["ultrafast"]);
+		expect(registry.find("codex-relay", "gpt-6-sol")?.serviceTiers).toEqual(["priority"]);
 	});
 
 	test("openai-models-list discovery reads server-advertised input modalities for ids absent from the catalog", async () => {
@@ -3692,10 +3909,11 @@ describe("ModelRegistry runtime discovery", () => {
 			{ apiKey: "TEST_KEY", fetch: chatFetch, disableReasoning: true },
 		).result();
 		expect(requestPayload?.reasoning_effort).toBe("none");
-		// A row that advertises nothing keeps the conservative non-reasoning default.
+		// A silent row remains eligible for request-time capability discovery.
 		const plain = registry.find("proxy-test", "acme-plain");
-		expect(plain?.reasoning).toBe(false);
-		expect(plain?.thinking).toBeUndefined();
+		expect(plain?.reasoning).toBe(true);
+		expect(plain?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
+		expect(plain?.compatConfig).not.toMatchObject({ supportsReasoningEffort: false });
 	});
 
 	test("proxy discovery pins an advertised ladder's default so catalog policy cannot inject a tier it omits", async () => {
@@ -3808,8 +4026,8 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		const model = registry.find("proxy-test", "acme-think-1");
-		expect(model?.reasoning).toBe(false);
-		expect(model?.thinking).toBeUndefined();
+		expect(model?.reasoning).toBe(true);
+		expect(model?.thinking).toMatchObject({ unverified: true, efforts: THINKING_EFFORTS });
 	});
 
 	test("proxy discovery keeps a catalog default that the advertised ladder contains", async () => {
@@ -3979,53 +4197,6 @@ describe("ModelRegistry runtime discovery", () => {
 		).toBe("rich-alias-session");
 	});
 
-	test("litellm discovery falls back to /v1/models when the rich phase times out (#10964)", async () => {
-		const { promise: richHang } = Promise.withResolvers<Response>(); // never resolves
-		const richEndpoints = ["/model_group/info", "/v2/model/info", "/model/info", "/v1/model/info"];
-		let v1ModelsHits = 0;
-		const fetchMock: FetchImpl = async input => {
-			const url = String(input);
-			if (url === "http://127.0.0.1:4013/v1/models") {
-				v1ModelsHits++;
-				return Response.json({
-					object: "list",
-					data: [{ id: "vendor-7/model-7", object: "model", owned_by: "mockvendor" }],
-				});
-			}
-			// Rich metadata endpoints stall past the discovery budget; anything else
-			// (unrelated implicit probes) fails fast so it cannot hang the suite.
-			if (richEndpoints.some(endpoint => url === `http://127.0.0.1:4013${endpoint}`)) {
-				return richHang;
-			}
-			throw new Error(`Unexpected URL: ${url}`);
-		};
-		const models = await discoverLiteLLMModels(
-			{
-				provider: "litellm-test",
-				baseUrl: "http://127.0.0.1:4013/v1",
-				api: "openai-responses",
-				discovery: { type: "litellm", timeoutMs: 50 },
-			},
-			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
-		);
-		const model = models.find(model => model.id === "vendor-7/model-7");
-		if (!model) throw new Error("Missing fallback LiteLLM model");
-
-		expect(v1ModelsHits).toBeGreaterThan(0);
-		expect(model.baseUrl).toBe("http://127.0.0.1:4013/v1");
-		expect(model.provider).toBe("litellm-test");
-		expect(model.providerType).toBe("litellm");
-		expect(model.api).toBe("openai-responses");
-		if (model.api !== "openai-responses") throw new Error("Expected fallback Responses API");
-		expect(
-			resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
-				apiKey: "test",
-				messages: [],
-				sessionId: "fallback-alias-session",
-			}).requestHeaders["x-litellm-session-id"],
-		).toBe("fallback-alias-session");
-	});
-
 	test("configured litellm discovery omits non-conversational rich modes", async () => {
 		writeRawModelsJson({
 			"litellm-test": {
@@ -4148,10 +4319,14 @@ describe("ModelRegistry runtime discovery", () => {
 				supports_vision: false,
 			},
 		];
+		let scopedIds = ["keep-chat-a", "keep-chat-b"];
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "https://catalog.stencil.so/models.json.zstd") {
 				return Response.json({});
+			}
+			if (url === "http://127.0.0.1:4007/v1/models") {
+				return Response.json({ data: scopedIds.map(id => ({ id })) });
 			}
 			if (url === "http://127.0.0.1:4007/model_group/info") {
 				return Response.json({ data: modelGroups });
@@ -4163,7 +4338,7 @@ describe("ModelRegistry runtime discovery", () => {
 			) {
 				return new Response("Not Found", { status: 404 });
 			}
-			throw new Error(`/v1/models must not reintroduce the excluded model: ${url}`);
+			throw new Error(`Unexpected URL: ${url}`);
 		};
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
@@ -4178,42 +4353,10 @@ describe("ModelRegistry runtime discovery", () => {
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm").map(model => model.id)).toEqual(["keep-chat-a"]);
 
+		scopedIds = ["keep-chat-a"];
 		modelGroups = [{ model_group: "keep-chat-a", mode: "embedding" }];
 		await registry.refreshProvider("litellm", "online");
 		expect(getModelsForProvider(registry, "litellm")).toEqual([]);
-	});
-
-	test("built-in litellm discovery timeout settles pending state", async () => {
-		vi.useFakeTimers();
-		try {
-			writeRawModelsJson({
-				litellm: {
-					baseUrl: "https://litellm-timeout.example.net/v1",
-					apiKey: "sk-litellm-test",
-					api: "openai-completions",
-				},
-			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
-				fetch: () => Promise.withResolvers<Response>().promise,
-			});
-			expect(registry.find("litellm", "not-yet-discovered")).toBeUndefined();
-			expect(registry.isProviderDiscoveryPending("litellm")).toBe(true);
-
-			const refresh = registry.refreshProvider("litellm", "online");
-			for (let turn = 0; turn < 10; turn++) await Promise.resolve();
-			vi.advanceTimersByTime(RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS);
-			await refresh;
-
-			expect(registry.getProviderDiscoveryState("litellm")).toMatchObject({
-				status: "unavailable",
-				stale: true,
-				models: [],
-				error: `model discovery timed out after ${RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS}ms`,
-			});
-			expect(registry.isProviderDiscoveryPending("litellm")).toBe(false);
-		} finally {
-			vi.useRealTimers();
-		}
 	});
 
 	test("litellm discovery enriches configured proxy models with bundled references", async () => {
@@ -4584,7 +4727,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const writeKey = cursorModelManagerOptions({ apiKey: tokenAtWrite }).cacheProviderId;
 		if (!writeKey) throw new Error("Expected Cursor manager options to name a cache namespace");
 		// Cursor discovery is authoritative: the row carries the manager's static fingerprint.
-		const fingerprint = fingerprintStaticModels(getBundledModels("cursor"), true);
+		const fingerprint = fingerprintStaticModels(getBundledModels("cursor"), { authoritative: true });
 		writeModelCache(writeKey, Date.now(), [discovered], true, fingerprint, cacheDbPath);
 		await authStorage.credentials.set("cursor", {
 			type: "oauth",

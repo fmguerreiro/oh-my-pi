@@ -18,6 +18,8 @@ import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
 import { editVariantForModel } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
+import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { resolveRoleChain } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { getAgentDbPath, getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import * as fileLock from "@oh-my-pi/pi-utils/file-lock";
@@ -69,6 +71,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { cfgMnemopiDbPath, cfgMnemopiScoping } from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
+import { cfgSpeechVoice, cfgTtsLocalVoice } from "@oh-my-pi/pi-coding-agent/tts/settings";
 import { cfgHindsightBankId, cfgHindsightScoping } from "@oh-my-pi/pi-coding-agent/hindsight/settings";
 import { cfgEditMode } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgExaEnabled } from "@oh-my-pi/pi-coding-agent/web/settings";
@@ -1824,7 +1827,7 @@ describe("Settings", () => {
 			"google-antigravity/gemini-2.5-flash",
 			"google/gemini-2.5-flash",
 			"anthropic/claude-haiku-4-5",
-			"openai-codex/gpt-5.6-luna",
+			"openai-codex/gpt-6-luna",
 			"xai/grok-4.5",
 			"web/exa",
 			"web/tavily",
@@ -1874,7 +1877,7 @@ describe("Settings", () => {
 				{ image: imageOrderedCandidates[0] },
 				{ image: imageOrderedCandidates.slice(1) },
 			],
-			["local speech provider", "providers.tts", "local", { speech: "local/kokoro" }, { speech: [] }],
+			["local speech provider", "providers.tts", "local", { speech: "local/phonon-31m" }, { speech: [] }],
 			["xAI speech provider", "providers.tts", "xai", { speech: "xai/grok-tts" }, { speech: [] }],
 			[
 				"DeepInfra speech provider",
@@ -1906,7 +1909,7 @@ describe("Settings", () => {
 			],
 			["tiny model", "providers.tinyModel", "lfm2.5-230m", { tiny: "local/lfm2.5-230m" }, {}],
 			["memory model", "providers.memoryModel", "lfm2-1.2b", { memory: "local/lfm2-1.2b" }, {}],
-			["local speech model", "tts.localModel", "kokoro", {}, {}],
+			["local speech model", "tts.localModel", "phonon-31m", {}, {}],
 			["fast dictation model", "stt.modelName", "fast", { dictation: "local/whisper-base" }, {}],
 			["balanced dictation model", "stt.modelName", "balanced", { dictation: "local/whisper-small" }, {}],
 			["turbo dictation model", "stt.modelName", "turbo", { dictation: "local/whisper-large-v3-turbo" }, {}],
@@ -1949,6 +1952,46 @@ describe("Settings", () => {
 				}
 			},
 		);
+
+		it("repairs the old generated web fallback pair without changing unrelated chains", async () => {
+			await writeSettings({
+				modelRoles: { web: "web/parallel" },
+				retry: {
+					fallbackChains: {
+						web: [
+							"web/searxng",
+							"openai-codex/gpt-6-luna",
+							"openai-codex/gpt-5.6",
+							"openai-codex/gpt-5.5",
+							"xai/grok-4.5",
+						],
+						slow: ["openai-codex/gpt-5.5"],
+					},
+				},
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(cfgRetryFallbackChains.get(settings)).toEqual({
+				web: ["web/searxng", "openai-codex/gpt-6-luna", "openai-codex/gpt-5.6-sol", "xai/grok-4.5"],
+				slow: ["openai-codex/gpt-5.5"],
+			});
+			const codex = getBundledModels("openai-codex").filter(model => model.webSearch);
+			expect(resolveRoleChain("web", settings, codex).map(candidate => candidate.model.id)).toEqual([
+				"gpt-6-luna",
+				"gpt-5.6-sol",
+			]);
+		});
+
+		it("preserves independently configured Codex web selectors", async () => {
+			await writeSettings({
+				retry: { fallbackChains: { web: ["openai-codex/gpt-5.5", "openai-codex/gpt-5.6"] } },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(cfgRetryFallbackChains.get(settings).web).toEqual(["openai-codex/gpt-5.5", "openai-codex/gpt-5.6"]);
+		});
 
 		it("keeps a legacy Gemini wire tier ahead of non-Gemini fallbacks", async () => {
 			await writeSettings({
@@ -2269,6 +2312,20 @@ describe("Settings", () => {
 			expect(cfgMemoryBackend.get(settings)).toBe("mnemopi");
 			expect(cfgMnemopiDbPath.get(settings)).toBe("/tmp/old.db");
 			expect(cfgMnemopiScoping.get(settings)).toBe("global");
+		});
+
+		it("migrates legacy Kokoro voices and speech role to Phonon", async () => {
+			await writeSettings({
+				tts: { localVoice: "bm_george" },
+				speech: { voice: "af_bella" },
+				modelRoles: { speech: "local/kokoro" },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(cfgTtsLocalVoice.get(settings)).toBe("edwin");
+			expect(cfgSpeechVoice.get(settings)).toBe("harper");
+			expect(settings.getModelRole("speech")).toBe("local/phonon-31m");
 		});
 
 		it("does not clobber an explicit mnemopi block when the legacy mnemosyne block is also present", async () => {

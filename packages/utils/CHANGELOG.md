@@ -2,6 +2,156 @@
 
 ## [Unreleased]
 
+## [19.0.0] - 2026-11-18
+
+### Added
+
+- Added utilities for formatting and parsing session spill URLs using the `local://N.log` format.
+- Added `postmortem.exitCleanlyOnStopSignals()` so long-running services exit successfully after completing cleanup on SIGINT or SIGTERM.
+
+### Fixed
+
+- Fixed Windows shell discovery incorrectly selecting the WSL `bash.exe` launcher, which could cause services to run under WSL.
+- Fixed archive opening so the extraction-size limit is enforced when an oversized member is read rather than preventing access to the entire archive.
+- Fixed `OMP_LOG_LEVEL` so it also controls console output from services such as `omp auth-broker serve`, not just log-file output.
+- Fixed Markdown parsing so emphasis and link labels are not prematurely terminated by marker characters inside code spans, autolinks, inline HTML tags, or link destinations.
+
+## [18.22.2] - 2026-11-18
+
+### Added
+
+- Added `readBoundedBody` and `readBoundedJson` for reading HTTP response bodies with a size limit, with an optional signal so a stalled peer cannot outlive the caller's deadline ([#18955](https://github.com/can1357/oh-my-pi/pull/18955) by [@Xytronix](https://github.com/Xytronix))
+
+## [18.21.0] - 2026-11-16
+
+### Fixed
+
+- Fixed bare URLs swallowing the following word when Korean, Japanese, or Chinese text follows a parenthesized URL without a space.
+
+## [18.20.3] - 2026-11-16
+
+### Fixed
+
+- Fixed HTML-to-Markdown conversion for fetched and pasted HTML to preserve whitespace in inline elements, maintain code indentation in preformatted blocks, and avoid inserting stray blank lines between block elements.
+
+## [18.20.2] - 2026-11-14
+
+### Added
+
+- Added a profile-aware data directory for managed Antigravity CLI installations and isolated account state.
+
+## [18.20.1] - 2026-11-14
+
+### Added
+
+- Added `mixHex` for blending two hexadecimal colors.
+
+### Fixed
+
+- Improved extraction of Cloud Code Assist quota reset information, including compound durations and reset timestamps, to provide more accurate retry guidance.
+
+## [18.19.0] - 2026-11-12
+
+### Added
+
+- Added browser utilities exposing trusted browser archive extraction limits and the installed WebKit host executable path.
+
+## [18.18.9] - 2026-11-11
+
+### Added
+
+- Added `prompt.renderTracked`: renders a template like `prompt.render` and reports where each `{{#each}}` iteration over a tracked item lands in the output ([#17971](https://github.com/can1357/oh-my-pi/pull/17971) by [@c-w-z](https://github.com/c-w-z))
+- Added `prompt.closeCodeFence`: closes a code fence a text leaves open, by the same rule `prompt.format` uses ([#17971](https://github.com/can1357/oh-my-pi/pull/17971) by [@c-w-z](https://github.com/c-w-z))
+
+## [18.18.8] - 2026-11-11
+
+### Removed
+
+- Removed `getConfigAgentDirName()`; use `getAgentDir()`, which also honors `PI_CODING_AGENT_DIR` ([#18684](https://github.com/can1357/oh-my-pi/issues/18684))
+
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- Added utilities for reading OpenTelemetry configuration from omp-managed `.env` files, including `$otelEnv` and `withOmpOtelEnv`.
+- Added filesystem path utilities for checking paths through symlinked roots, including paths that do not yet exist, and for optionally propagating filesystem errors in directory checks.
+
+### Fixed
+
+- Fixed relaxed JSON parsing so `__proto__` is preserved as a regular own property rather than modifying the parsed object's prototype.
+- Fixed SIGHUP handling so stopped terminal sessions display recovery hints, including the `--resume` command.
+
+## [18.18.0] - 2026-11-07
+
+### Fixed
+
+- Fixed abort signals leaving command output reads blocked when a descendant keeps stdout or stderr open after the root process exits. ([#18309](https://github.com/can1357/oh-my-pi/pull/18309) by [@eggpeat](https://github.com/eggpeat))
+
+## [18.17.0] - 2026-11-06
+
+### Added
+
+- Added `getUpdateStateDir()`, returning the auto-update state directory (`~/.omp/update`).
+- Added `logger.setLogForwarder()` and `logger.emitForeign()` to forward log records across threads, preserving context and timestamps.
+- Added `expandTilde()` to expand a leading `~` to the home directory.
+
+### Fixed
+
+- Fixed `spawn`/`exec` timeouts never firing when the command's root exited before `spawn()` returned, which let a descendant holding stdout or stderr stall output reads until it exited.
+- `ptree` commands with `subreaper: true` now reliably terminate all descendants on graceful shutdown.
+- `fatal()` in a worker thread now reaches the parent's `error` listeners instead of only exiting with code 1.
+- Fixed the terminal stderr guard leaking a copy of the terminal into processes spawned from native code.
+
+## [18.16.0] - 2026-11-02
+
+### Added
+
+- Added `isPidAlive` (signal-0 liveness probe) and `asStrictBytes` (a `Uint8Array` narrowed to its own `ArrayBuffer` for WebCrypto)
+- Added `ensureSqliteLockShim()`, which `openSqliteDatabase`/`openSqliteDatabaseSync` call before opening a store, so on Linux the process's SQLite locks are open-file-description locks that other closes of the file cannot release ([#15586](https://github.com/can1357/oh-my-pi/issues/15586))
+- Added `assertNotHeldOpen(path)` (`@oh-my-pi/pi-utils/held-file`), which throws `EBUSY` for a SQLite database or `-shm` this process holds open ([#15586](https://github.com/can1357/oh-my-pi/issues/15586))
+
+### Changed
+
+- `acp` runtime validators (`zNewSessionResponse`, `zSessionNotification`, …) now report each failing field's path and reason in `error.issues` instead of a single `Invalid <label>`; `ValidationError` issue paths are typed `PropertyKey[]` ([#17699](https://github.com/can1357/oh-my-pi/pull/17699))
+
+## [18.15.0] - 2026-11-01
+
+### Added
+
+- Added abortable `sleepUntil` for wall-clock deadline waits that include system sleep, with bounded timer slices to recheck deadlines after resume ([#17606](https://github.com/can1357/oh-my-pi/pull/17606) by [@zhiland](https://github.com/zhiland)).
+
+### Fixed
+
+- Importing pi-utils no longer installs process-wide signal and fatal handlers in embedding hosts; exit-time cleanup stays installed ([#17674](https://github.com/can1357/oh-my-pi/issues/17674)).
+
+## [18.14.2] - 2026-10-31
+
+### Added
+
+- Added `oklabDistance`, the perceptual distance between two hex colors ([#17520](https://github.com/can1357/oh-my-pi/pull/17520))
+
+## [18.14.1] - 2026-10-31
+
+### Added
+
+- Added `isFileLockHeld`, which reports whether a file lock is held without acquiring it ([#17428](https://github.com/can1357/oh-my-pi/pull/17428) by [@andrebrait](https://github.com/andrebrait))
+
+## [18.14.0] - 2026-10-29
+
+### Added
+
+- Added `logger.withContext(fields, fn)` to attach contextual fields to all records produced during a function and its asynchronous work, plus `logger.withoutContext(fn)` for work that should not inherit caller context.
+
+### Fixed
+
+- Fixed `untilAborted` so promises passed to an already-aborted signal are still observed, preventing later rejections from being reported as unhandled.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
 ## [18.13.2] - 2026-10-27
 
 ### Added

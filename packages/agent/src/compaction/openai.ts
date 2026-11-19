@@ -18,8 +18,11 @@
 import { attach, create, Flag, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { getCodexAttestationHeader } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
-import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
-import { createOpenAICodexCompatibilityMetadata } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	applyCodexResponsesLiteShape,
+	moveCodexInstructionsToInput,
+	withCodexRoutingFieldsFirst,
+} from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import {
 	applyInferenceHeaders,
 	applySessionHeader,
@@ -40,16 +43,19 @@ import type {
 	Message,
 	Model,
 	ProviderSessionState,
+	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai/types";
 import {
 	dropMalformedOpenAIResponsesToolCalls,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
 	normalizeResponsesToolCallId,
+	stripOpenAIResponsesInternalMetadataForReplay,
 	stripOpenAIResponsesOutputOnlyStatusesForReplay,
 	truncateResponseItemId,
 } from "@oh-my-pi/pi-ai/utils";
 import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
+import { withResolvedHeaders } from "@oh-my-pi/pi-ai/utils/model-headers";
 import { isBedrockOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	applyCodexResidencyHeader,
@@ -64,7 +70,12 @@ import { dataUrlImageSize } from "../image-tokens";
 import { Tokenizer } from "../tokenizer";
 import { appendAzureApiVersion, resolveAzureOpenAiBaseUrl } from "./azure-openai-endpoint";
 import { prepareBedrockCompactionRequest } from "./bedrock";
-import { isOpenAiRemoteCompactionApi, remoteCompactionPolicyModel } from "./compaction-v2-streaming";
+import {
+	isOpenAiRemoteCompactionApi,
+	parseResponsesCompactionUsage,
+	type ResponsesCompactionUsage,
+	remoteCompactionPolicyModel,
+} from "./compaction-v2-streaming";
 import contextWindowTruncatedOutputPrompt from "./prompts/context-window-truncated-output.md" with { type: "text" };
 
 export * from "./compaction-v2-streaming";
@@ -372,7 +383,10 @@ export interface OpenAiRemoteCompactionRequest {
 	include?: string[];
 }
 
-export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
+/** A `/responses/compact` result: the history to preserve, plus the usage the body reported. */
+export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {
+	usage?: ResponsesCompactionUsage;
+}
 
 export interface RemoteCompactionRequest {
 	systemPrompt: string;
@@ -847,6 +861,9 @@ export function buildOpenAiNativeHistory(
 		msgIndex++;
 	}
 
+	for (let index = 0; index < input.length; index++) {
+		input[index] = stripOpenAIResponsesInternalMetadataForReplay(input[index]!);
+	}
 	return stripOpenAIResponsesOutputOnlyStatusesForReplay(hoistInterleavedResponsesToolBatchMessages(input));
 }
 
@@ -876,6 +893,7 @@ export async function requestOpenAiRemoteCompaction(
 		rewriteOutputs?: boolean;
 	},
 ): Promise<OpenAiRemoteCompactionResponse> {
+	model = await withResolvedHeaders(model, signal);
 	let fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	if (isBedrockOpenAIUrl(model.baseUrl)) {
 		({ model, apiKey, fetch: fetchImpl } = await prepareBedrockCompactionRequest(model, apiKey, opts?.fetch, signal));
@@ -950,6 +968,9 @@ export async function requestOpenAiRemoteCompaction(
 
 	// Codex endpoints require additional auth headers
 	if (isCodexResponses) {
+		// Keep transport loading on the actual Codex request path, not compaction policy inspection.
+		const { createOpenAICodexCompatibilityMetadata } =
+			await import("@oh-my-pi/pi-ai/providers/openai-codex-responses");
 		const accountId = getCodexAccountId(apiKey);
 		if (accountId) {
 			headers[OPENAI_HEADERS.ACCOUNT_ID] = accountId;
@@ -959,7 +980,6 @@ export async function requestOpenAiRemoteCompaction(
 		if (attestation) {
 			headers[OPENAI_HEADERS.ATTESTATION] = attestation;
 		}
-		headers[OPENAI_HEADERS.BETA] = OPENAI_HEADER_VALUES.BETA_RESPONSES;
 		headers[OPENAI_HEADERS.ORIGINATOR] = OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
 		// This compaction request sends no `service_tier`, so the hint is model-only.
 		headers[OPENAI_HEADERS.ROUTING_HINT] = codexRoutingHint(request.model, undefined);
@@ -976,9 +996,10 @@ export async function requestOpenAiRemoteCompaction(
 				includeInstallationHeader: true,
 			}).headers,
 		);
-		// Responses Lite models take the same rewrite on `/responses/compact`:
-		// instructions ride as an input item and the lite marker header is set
-		// (codex-rs routes compaction through `build_responses_request`).
+		// codex-rs routes `/responses/compact` through `build_responses_request`:
+		// instructions always ride as a leading input item, and Responses Lite
+		// models additionally take the Lite rewrite and marker header.
+		moveCodexInstructionsToInput(request);
 		if (model.useResponsesLite) {
 			applyCodexResponsesLiteShape(request);
 			headers[OPENAI_HEADERS.RESPONSES_LITE] = "true";
@@ -993,7 +1014,7 @@ export async function requestOpenAiRemoteCompaction(
 	const response = await fetchImpl(endpoint, {
 		method: "POST",
 		headers,
-		body: stringifyJson(request),
+		body: stringifyJson(isCodexResponses ? withCodexRoutingFieldsFirst(request) : request),
 		signal: ptree.combineSignals(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 	});
 
@@ -1015,7 +1036,7 @@ export async function requestOpenAiRemoteCompaction(
 		);
 	}
 
-	const data = (await response.json()) as { output?: unknown[] } | undefined;
+	const data = (await response.json()) as { output?: unknown[]; usage?: unknown } | undefined;
 	const rawOutput = data?.output ?? [];
 	const replacementHistory = rawOutput.filter(
 		(item): item is Record<string, unknown> =>
@@ -1040,7 +1061,8 @@ export async function requestOpenAiRemoteCompaction(
 		});
 		throw new Error("Remote compaction response missing compaction item");
 	}
-	return { provider: model.provider, replacementHistory, compactionItem };
+	const usage = parseResponsesCompactionUsage(data?.usage);
+	return { provider: model.provider, replacementHistory, compactionItem, ...(usage ? { usage } : {}) };
 }
 
 /**
@@ -1053,16 +1075,24 @@ export async function requestOpenAiRemoteCompaction(
  * HTTP 400 `"'messages' is required"`, compaction silently fell back to
  * local summarization, and context grew unbounded.
  *
- * When `context.model` is provided the chat-completions body is tagged with
- * that model's wire id (llama.cpp requires the field) and `context.apiKey` is
- * forwarded as `Authorization: Bearer`. Callers wrap this in `withAuth` so
- * 401s force-refresh through the standard credential rotation policy.
+ * On chat-completions endpoints the model's request headers are resolved for
+ * each call, its wire id is sent (llama.cpp requires it), and `opts.apiKey` is
+ * forwarded as `Authorization: Bearer`. Custom summarizers receive no model
+ * credentials. `opts.onPayload` can inspect or replace either request body.
+ * Callers wrap this in `withAuth` so 401s force-refresh through the standard
+ * credential rotation policy.
  */
 export async function requestRemoteCompaction(
 	endpoint: string,
 	request: RemoteCompactionRequest,
 	signal?: AbortSignal,
-	opts?: { fetch?: FetchImpl; timeoutMs?: number; model?: Model; apiKey?: string },
+	opts?: {
+		fetch?: FetchImpl;
+		timeoutMs?: number;
+		model?: Model;
+		apiKey?: string;
+		onPayload?: SimpleStreamOptions["onPayload"];
+	},
 ): Promise<RemoteCompactionResponse> {
 	let endpointPath = endpoint;
 	try {
@@ -1071,13 +1101,18 @@ export async function requestRemoteCompaction(
 		// Keep the raw endpoint for relative/custom fetch implementations.
 	}
 	const isChatCompletions = /\/chat\/completions\/?$/.test(endpointPath);
-	const headers: Record<string, string> = { "content-type": "application/json" };
+	const headers = new Headers({ "content-type": "application/json" });
 	if (isChatCompletions) {
-		if (opts?.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
-		if (opts?.model?.headers) Object.assign(headers, opts.model.headers);
+		if (opts?.apiKey) headers.set("Authorization", `Bearer ${opts.apiKey}`);
+		const model = opts?.model;
+		const configuredHeaders = model ? (await withResolvedHeaders(model, signal)).headers : undefined;
+		// `set` replaces case-insensitively, so a configured `authorization` overrides the default bearer.
+		if (configuredHeaders) {
+			for (const name in configuredHeaders) headers.set(name, configuredHeaders[name]!);
+		}
 	}
 
-	const body: Record<string, unknown> = isChatCompletions
+	let body: unknown = isChatCompletions
 		? {
 				model: opts?.model ? resolveOpenAiCompactModel(opts.model) : undefined,
 				messages: [
@@ -1088,6 +1123,8 @@ export async function requestRemoteCompaction(
 				max_tokens: request.maxTokens,
 			}
 		: { systemPrompt: request.systemPrompt, prompt: request.prompt, maxTokens: request.maxTokens };
+	const replacement = await opts?.onPayload?.(body, opts.model, signal);
+	if (replacement !== undefined) body = replacement;
 
 	const response = await (opts?.fetch ?? fetch)(endpoint, {
 		method: "POST",

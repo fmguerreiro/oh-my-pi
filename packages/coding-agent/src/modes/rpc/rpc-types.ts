@@ -19,6 +19,8 @@ import type {
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { WireSessionEvent } from "../../session/loop-end-wire";
+import type { SessionLeaseReport } from "../../session/session-storage";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
@@ -86,6 +88,7 @@ export type RpcCommand =
 	| { id?: string; type: "steer_subagent"; subagentId: string; message: string }
 	// Live voice (GPT live bound to this session)
 	| { id?: string; type: "live_start"; voice?: string; instructions?: string }
+	| { id?: string; type: "live_connect"; sdpOffer: string; voice?: string; instructions?: string }
 	| { id?: string; type: "live_stop" }
 	| { id?: string; type: "live_mute"; muted?: boolean }
 
@@ -120,11 +123,12 @@ export type RpcCommand =
 	| { id?: string; type: "abort_retry" }
 
 	// Bash
-	| { id?: string; type: "bash"; command: string }
+	| { id?: string; type: "bash"; command: string; excludeFromContext?: boolean }
 	| { id?: string; type: "abort_bash" }
 
 	// Session
 	| { id?: string; type: "get_session_stats" }
+	| { id?: string; type: "get_session_lease"; sessionIds: string[] }
 	| { id?: string; type: "export_html"; outputPath?: string }
 	| { id?: string; type: "switch_session"; sessionPath: string; provider?: string; modelId?: string }
 	| { id?: string; type: "branch"; entryId: string }
@@ -195,7 +199,7 @@ export interface RpcSessionState {
 	tokensPerSecond: number | null;
 	messageCount: number;
 	queuedMessageCount: number;
-	/** Background jobs or deliveries can still inject a follow-up and wake the session. */
+	/** Background jobs, their deliveries, child agents or queued peer messages can still wake the session. */
 	hasPendingAsyncWork: boolean;
 	/** Same predicate as `session_settled`: idle with nothing queued or pending. */
 	isSettled: boolean;
@@ -376,6 +380,8 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** `bash` accepts `excludeFromContext`; older runtimes omit this capability. Require exactly `true`. */
+	supportsBashExcludeFromContext?: boolean;
 }
 
 export interface RpcChunkFrame {
@@ -591,6 +597,7 @@ export type RpcResponse =
 
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }
+	| { id?: string; type: "response"; command: "get_session_lease"; success: true; data: SessionLeaseReport }
 	| { id?: string; type: "response"; command: "export_html"; success: true; data: { path: string } }
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "branch"; success: true; data: { text: string; cancelled: boolean } }
@@ -615,6 +622,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 	// Live voice
 	| { id?: string; type: "response"; command: "live_start"; success: true; data: { voice: string } }
+	| {
+			id?: string;
+			type: "response";
+			command: "live_connect";
+			success: true;
+			data: { voice: string; sdpAnswer: string };
+	  }
 	| { id?: string; type: "response"; command: "live_stop"; success: true }
 	| { id?: string; type: "response"; command: "live_mute"; success: true; data: { muted: boolean } }
 	// Draft-only speech-to-text
@@ -747,9 +761,7 @@ export type RpcDeltaMessageUpdateFrame = Omit<
 };
 
 /** Session event as written to stdout by default: message lifecycle events carry a `messageId`. */
-export type RpcAgentSessionEventFrame =
-	| Exclude<AgentSessionEvent, { type: RpcMessageEventType }>
-	| RpcMessageEventFrame;
+export type RpcAgentSessionEventFrame = Exclude<WireSessionEvent, { type: RpcMessageEventType }> | RpcMessageEventFrame;
 
 /** Every session event shape RPC mode can write, including the opt-in `messageUpdates: "delta"` projection. */
 export type RpcProjectedSessionEventFrame = RpcAgentSessionEventFrame | RpcDeltaMessageUpdateFrame;
@@ -784,6 +796,14 @@ export type RpcExtensionUIRequest =
 			title: string;
 			options: string[];
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			/** Index into `options` to focus first. */
+			initialIndex?: number;
+			/** Marker style for the first `markableCount` options. */
+			selectionMarker?: "radio" | "checkbox";
+			/** For `checkbox`: indices into `options` currently checked. */
+			checkedIndices?: number[];
+			/** Leading options that get a marker; trailing ones are actions. */
+			markableCount?: number;
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }

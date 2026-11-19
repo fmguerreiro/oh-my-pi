@@ -64,6 +64,8 @@ export function runBtwTurn(
 		/** Images attached to this question; earlier turns replay their own. */
 		images?: ImageContent[];
 		history?: readonly BtwHistoryTurn[];
+		/** Ask for steering prompts in an `<inject>` block (the `btw.inject` setting). */
+		inject?: boolean;
 		conversationKey: string;
 		onTextDelta: (delta: string) => void;
 		signal: AbortSignal;
@@ -76,7 +78,7 @@ export function runBtwTurn(
 		history.push({
 			role: "user",
 			content: [
-				{ type: "text", text: prompt.render(btwUserPrompt, { question: turn.question }) },
+				{ type: "text", text: prompt.render(btwUserPrompt, { question: turn.question, inject: args.inject }) },
 				...(turn.images ?? []),
 			],
 			attribution: "agent",
@@ -104,13 +106,14 @@ export function runBtwTurn(
 		});
 	}
 	return session.runEphemeralTurn({
-		promptText: prompt.render(btwUserPrompt, { question: args.question }),
+		promptText: prompt.render(btwUserPrompt, { question: args.question, inject: args.inject }),
 		promptImages: args.images,
 		history,
 		conversationKey: args.conversationKey,
 		// /btw answers are read in full and saved to history: keep the
 		// repeated-line collapse, but not the 4 KiB cap meant for one-liners.
 		replyMaxBytes: Number.POSITIVE_INFINITY,
+		purpose: "btw",
 		onTextDelta: args.onTextDelta,
 		signal: args.signal,
 	});

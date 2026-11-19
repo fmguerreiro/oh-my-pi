@@ -1,23 +1,24 @@
 /**
  * Focused subagent views are chat-only, except for viewer-scoped commands: `/btw`
- * asks a side question about the focused transcript, `/export` writes the focused
- * agent's own transcript (with its nested subagents), `/jobs` lists the focused
- * agent's background jobs, `/usage` reports account-wide limits, and the model and
- * thinking controls (`/model`, `/switch`, `/effort`, their keys) act on the focused
- * agent's session. Everything else, and mutating forms such as `/usage reset` and
- * `/jobs kill`, still requires returning to main.
+ * asks a side question about the focused transcript, `/copy` picks from it,
+ * `/export` writes the focused agent's own transcript (with its nested subagents),
+ * `/jobs` lists the focused agent's background jobs, `/usage` reports account-wide
+ * limits, and the model and thinking controls (`/model`, `/switch`, `/effort`, their
+ * keys) act on the focused agent's session. Everything else, and mutating forms such
+ * as `/usage reset` and `/jobs kill`, still requires returning to main.
  *
  * Failure mode if this regresses: these commands silently do nothing (or steer the
- * agent) in a focused view, `/export` writes the main session instead of the viewed
- * one, or a model/thinking change lands on the main session instead of the agent.
+ * agent) in a focused view, `/copy` or `/export` reads the main session instead of
+ * the viewed one, or a model/thinking change lands on the main session instead of
+ * the agent.
  */
-import { afterEach, describe, expect, it, vi } from "bun:test";
-import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
+import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { beginSettingsTest, restoreSettingsTestState } from "./helpers/settings-test-state";
 
 function createFocusedContext() {
@@ -42,6 +43,7 @@ function createFocusedContext() {
 		clearDraft: vi.fn(),
 	};
 	const prompt = vi.fn(async () => {});
+	const resume = vi.fn(async () => {});
 	const ctx = {
 		editor,
 		ui: { requestRender: vi.fn() },
@@ -53,7 +55,7 @@ function createFocusedContext() {
 			customCommands: [],
 			promptTemplates: [],
 		},
-		viewSession: { isStreaming: false, queuedMessageCount: 0, prompt, abort: vi.fn(async () => {}) },
+		viewSession: { isStreaming: false, queuedMessageCount: 0, prompt, resume, abort: vi.fn(async () => {}) },
 		focusedAgentId: "Worker",
 		skillCommands: new Map(),
 		fileSlashCommands: new Set<string>(),
@@ -70,7 +72,7 @@ function createFocusedContext() {
 		showResetUsageSelector: vi.fn(async () => {}),
 		withLocalSubmission: vi.fn(async <T>(_text: string, fn: () => Promise<T>) => fn()),
 	};
-	return { ctx: ctx as unknown as InteractiveModeContext, raw: ctx, editor, prompt };
+	return { ctx: ctx as unknown as InteractiveModeContext, raw: ctx, editor, prompt, resume };
 }
 
 async function submit(text: string) {
@@ -87,28 +89,14 @@ describe("focused subagent view slash commands", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("continues the focused session with a synthetic directive for . and c", async () => {
+	it("resumes the focused session for . and c", async () => {
 		for (const shortcut of [".", "c"]) {
-			const { prompt, editor, raw } = await submit(shortcut);
-			expect(prompt).toHaveBeenCalledWith(manualContinuePrompt, {
-				synthetic: true,
-				userInitiated: true,
-			});
+			const { prompt, resume, editor, raw } = await submit(shortcut);
+			expect(resume).toHaveBeenCalledTimes(1);
+			expect(prompt).not.toHaveBeenCalled();
 			expect(editor.clearDraft).toHaveBeenCalledWith(shortcut);
 			expect(raw.withLocalSubmission).not.toHaveBeenCalled();
 		}
-	});
-
-	it("restores a focused continue shortcut when the target is busy", async () => {
-		const { ctx, raw, editor, prompt } = createFocusedContext();
-		prompt.mockRejectedValueOnce(new AgentBusyError());
-		const controller = new InputController(ctx);
-		controller.setupEditorSubmitHandler();
-		await ctx.editor.onSubmit?.(".");
-
-		expect(editor.getText()).toBe(".");
-		expect(raw.showError).toHaveBeenCalledTimes(1);
-		expect(prompt).toHaveBeenCalledWith(manualContinuePrompt, { synthetic: true, userInitiated: true });
 	});
 
 	it("runs /usage from the focused view", async () => {
@@ -139,6 +127,25 @@ describe("focused subagent view slash commands", () => {
 		const { raw, prompt } = await submit("/btw what is it doing?");
 		expect(raw.handleBtwCommand).toHaveBeenCalledWith("what is it doing?", undefined);
 		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("copies the focused agent's last code block with /copy code instead of steering the agent", async () => {
+		const copySpy = spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+		const codeMessage = (code: string) =>
+			({
+				role: "assistant",
+				content: [{ type: "text", text: `\`\`\`ts\n${code}\n\`\`\`` }],
+			}) as unknown as AgentMessage;
+		const focused = createFocusedContext();
+		Object.assign(focused.raw.session, { messages: [codeMessage("const main = 1;")] });
+		Object.assign(focused.raw.viewSession, { messages: [codeMessage("const worker = 1;")] });
+		const controller = new InputController(focused.ctx);
+		controller.setupEditorSubmitHandler();
+		focused.editor.setText("/copy code");
+		await focused.ctx.editor.onSubmit?.("/copy code");
+
+		expect(copySpy).toHaveBeenCalledWith("const worker = 1;");
+		expect(focused.prompt).not.toHaveBeenCalled();
 	});
 
 	it("answers a side file command from the focused view and releases its draft", async () => {

@@ -3,13 +3,14 @@
 > Applies source edits. The default `hashline` mode consumes one line-anchored patch string and edits existing files directly.
 
 ## Source
+
 - Entry and mode registration: `packages/coding-agent/src/edit/index.ts`
 - Mode schemas: `packages/coding-agent/src/edit/schemas.ts`
-- Model-facing prompts: `crates/pi-edit/prompts/`; compact hashline variant: `packages/coding-agent/src/edit/hashline-compact.md`
-- Constrained-decoding grammars: `crates/pi-edit/grammars/`
-- Native bridge: `crates/pi-natives/src/edit.rs` — `EditSession`, `EditStore`, inspection, prompt/grammar exports
-- Hashline parser/application: `crates/pi-edit/src/modes/hashline/`
-- Snapshot/register state: `crates/pi-edit/src/store.rs`; staging, streaming previews, and result shaping: `crates/pi-edit/src/session.rs`
+- Model-facing prompts: `crates/edit/prompts/`; compact hashline variant: `packages/coding-agent/src/edit/hashline-compact.md`
+- Constrained-decoding grammars: `crates/edit/grammars/`
+- Native bridge: `crates/natives/src/edit.rs` — `EditSession`, `EditStore`, inspection, prompt/grammar exports
+- Hashline parser/application: `crates/edit/src/modes/hashline/`
+- Snapshot/register state: `crates/edit/src/store.rs`; staging, streaming previews, and result shaping: `crates/edit/src/session.rs`
 - Host writes, LSP integration, and parse-regression handling: `packages/coding-agent/src/edit/index.ts`
 - Mode selection/settings: `packages/coding-agent/src/utils/edit-mode.ts`, `packages/coding-agent/src/edit/settings.ts`
 
@@ -22,15 +23,15 @@
 3. `edit.mode`;
 4. default `hashline`.
 
-Supported modes are `hashline`, `apply_patch`, `patch`, `replace`, and `sloppy`. `edit.modelVariants` uses the first case-insensitive substring match against the active model string. `PI_EDIT_VARIANT` pins the mode exactly; for settings-derived `hashline`, `PI_STRICT_EDIT_MODE` disables the model-family fallback to `replace` (Kimi, MiMo, MiniMax, DeepSeek, StepFun, Codex Spark, and GLM 5.3 Flash).
+Supported modes are `hashline`, `apply_patch`, `patch`, `replace`, and `sloppy`. `edit.mode: none` (or `PI_EDIT_VARIANT=none`) instead unregisters `edit`, wins over `edit.modelVariants`, turns off hashline anchors, and keeps `bash` registered regardless of `bash.enabled`; explicit tool lists still get `bash` only when they name it. `edit.modelVariants` uses the longest case-insensitive substring match against the active model string; equal-length matches keep config order. `PI_EDIT_VARIANT` pins the mode exactly; for settings-derived `hashline`, `PI_STRICT_EDIT_MODE` disables the model-family fallback to `replace` (Kimi, MiMo, MiniMax, DeepSeek, StepFun, Codex Spark, and GLM 5.3 Flash).
 
-This page primarily documents hashline. The schema, prompt, examples, renderer, and optional Lark format switch with the mode. Models with `editPromptVariant: "compact"` receive the compact hashline prompt. In `apply_patch` custom-tool mode the wire name is `apply_patch`; dispatch still reaches the same internal tool. The tool is strict, essential, and uses exclusive concurrency.
+This page primarily documents hashline. The schema, prompt, examples, renderer, and optional Lark format switch with the mode. Models with `editPromptVariant: "compact"` receive the compact hashline prompt. In `apply_patch` custom-tool mode the wire name is `apply_patch`; dispatch, including `xd://apply_patch`, still reaches the same internal tool. The tool is strict, essential, and uses exclusive concurrency.
 
 ## Input
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `input` | `string` | Yes | One or more `[PATH#TAG]` sections containing hashline operations. The strict custom-tool grammar wraps the sections in `*** Begin Patch` / `*** End Patch`; the normal parser also accepts an unwrapped payload. |
+| Field   | Type     | Required | Description                                                                                                                                                                                                      |
+| ------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input` | `string` | Yes      | One or more `[PATH#TAG]` sections containing hashline operations. The strict custom-tool grammar wraps the sections in `*** Begin Patch` / `*** End Patch`; the normal parser also accepts an unwrapped payload. |
 
 Each section edits one existing file and MUST copy the four-uppercase-hex snapshot tag from the latest anchored `read`, `grep`, or successful `edit` result:
 
@@ -46,19 +47,19 @@ Use `write` to create or wholly overwrite a file. Hashline rejects untagged anch
 
 All line numbers refer to the original tagged snapshot, not to earlier hunks in the same call.
 
-| Form | Effect |
-| --- | --- |
-| `PUT N.=M:` | Replace inclusive original lines `N..M` with the following `+TEXT` rows. |
-| `PUT N*:` | Replace the multi-line syntactic block beginning on line `N`. |
-| `PUT <N:` / `PUT >N:` | Insert body rows immediately before / after line `N`. `PUT <1:` is file head. |
-| `PUT >$:` | Append body rows at file tail. |
-| `PUT >N*:` | Insert after the syntactic block beginning on line `N`. |
-| `CUT N.=M` / `CUT N*` | Delete and capture an inclusive range or resolved block. Add `@name` to write a named register. |
-| `PUT <N` / `PUT >N` / `PUT >$` | Paste the anonymous register into a gap. |
-| `PUT <N @name` / `PUT >N @name` / `PUT >$ @name` | Paste a named register into a gap. |
-| `PUT N.=M @name` / `PUT N* @name` | Replace a range or block with a named register. Named registers are required for span/block paste. |
-| `REM` | Delete the section file. |
-| `MV DEST` | Write the edited file to the destination, then delete the source. Existing destination contents can be overwritten; quote destinations containing spaces. |
+| Form                                             | Effect                                                                                                                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT N.=M:`                                      | Replace inclusive original lines `N..M` with the following `+TEXT` rows.                                                                                  |
+| `PUT N*:`                                        | Replace the multi-line syntactic block beginning on line `N`.                                                                                             |
+| `PUT <N:` / `PUT >N:`                            | Insert body rows immediately before / after line `N`. `PUT <1:` is file head.                                                                             |
+| `PUT >$:`                                        | Append body rows at file tail.                                                                                                                            |
+| `PUT >N*:`                                       | Insert after the syntactic block beginning on line `N`.                                                                                                   |
+| `CUT N.=M` / `CUT N*`                            | Delete and capture an inclusive range or resolved block. Add `@name` to write a named register.                                                           |
+| `PUT <N` / `PUT >N` / `PUT >$`                   | Paste the anonymous register into a gap.                                                                                                                  |
+| `PUT <N @name` / `PUT >N @name` / `PUT >$ @name` | Paste a named register into a gap.                                                                                                                        |
+| `PUT N.=M @name` / `PUT N* @name`                | Replace a range or block with a named register. Named registers are required for span/block paste.                                                        |
+| `REM`                                            | Delete the section file.                                                                                                                                  |
+| `MV DEST`                                        | Write the edited file to the destination, then delete the source. Existing destination contents can be overwritten; quote destinations containing spaces. |
 
 Register names contain ASCII letters, digits, `_`, or `-`. The anonymous register is batch-local and starts empty on every call. Named registers persist for the session and are published only after their writes land. Operations run top-to-bottom across sections, so a cut in an earlier section can feed a later paste. Repeating a paste does not consume its register.
 
@@ -68,7 +69,7 @@ Only body-bearing `PUT ...:` headers take body rows. Every body row is `+TEXT`; 
 
 Block forms resolve from the opening line through the tree-sitter node's end. Anchor the construct opener, never a closing delimiter, last visible line, blank line, or inner statement. A single-line node is rejected with guidance to use the corresponding explicit-line operation. `PUT >N*:` lowers to ordinary `PUT >N:` with a warning when no block resolves; replace/cut block forms fail instead of guessing.
 
-Leading decorators, attributes, and doc-comments may be separate syntax nodes. Anchor the first decorator when the parser groups it with the declaration; otherwise use an explicit range. Standalone line comments are not swept automatically. In Markdown, a heading's block includes its body and deeper subsections through the next heading of equal or higher level.
+Leading decorators, attributes, and doc-comments may be separate syntax nodes. Anchor the first decorator when the parser groups it with the declaration. In Rust, the first outer attribute (`#[...]`) or outer doc comment (`///`, `/** */`) of an item also resolves through the item, past any further attributes and comments. A later attribute or doc comment of the same item, or one with no item after it, is rejected like a single-line node, however many lines it spans. Otherwise use an explicit range. Standalone line comments are not swept automatically. In Markdown, a heading's block includes its body and deeper subsections through the next heading of equal or higher level.
 
 Use tight ranges and separate non-adjacent changes. Do not use `edit` merely to reformat or restyle code; run the project's formatter after the substantive edit.
 
@@ -121,16 +122,16 @@ MV lib/welcome.py
 
 ## Other wire contracts
 
-| Mode | Parameters | Edit form |
-| --- | --- | --- |
-| `replace` | `path`, `old_string`, `new_string`, optional `replace_all` | Replace quoted text in one file. |
-| `patch` | `path`, `edits: Array<{ op?: "create" \| "delete" \| "update"; rename?: string; diff?: string }>` | Patch entries all target the top-level `path`; separate calls for different files. |
-| `apply_patch` | `input` | Combined `*** Begin Patch` payload with `*** Add File`, `*** Update File`, `*** Move to`, and `*** Delete File` sections. |
-| `sloppy` | `input` | `*** Edit File: path`, then `*** Find` plus `*** Replace`, `*** Insert Before`, or `*** Insert After`. |
+| Mode          | Parameters                                                                                        | Edit form                                                                                                                 |
+| ------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `replace`     | `path`, `old_string`, `new_string`, optional `replace_all`                                        | Replace quoted text in one file.                                                                                          |
+| `patch`       | `path`, `edits: Array<{ op?: "create" \| "delete" \| "update"; rename?: string; diff?: string }>` | Patch entries all target the top-level `path`; separate calls for different files.                                        |
+| `apply_patch` | `input`                                                                                           | Combined `*** Begin Patch` payload with `*** Add File`, `*** Update File`, `*** Move to`, and `*** Delete File` sections. |
+| `sloppy`      | `input`                                                                                           | `*** Edit File: path`, then `*** Find` plus `*** Replace`, `*** Insert Before`, or `*** Insert After`.                    |
 
 `sloppy` uses existing-text anchors, not snapshot tags. Find must identify one match unless the file header ends in ` all`; bare `*** Edit File:` continues the current target. Bodies are raw text, without diff prefixes or closing markers. `…` in Find captures omitted text; Replace re-emits those captures in order. Insert keeps the anchor and treats `…` literally. Every pair addresses the original file; matching/validation failures occur before writes.
 
-The mode prompts in `crates/pi-edit/prompts/` define the full syntax.
+The mode prompts in `crates/edit/prompts/` define the full syntax.
 
 `apply_patch` matches complete old/context lines in this order: exact, trailing
 whitespace trimmed, both ends trimmed, then Unicode punctuation normalized.

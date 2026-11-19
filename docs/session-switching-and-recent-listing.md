@@ -133,7 +133,7 @@ Uses `SessionManager.continueRecent(...)` directly (breadcrumb-first behavior ab
 - Tab toggles current-folder / all-projects scope; the all-projects list is loaded lazily or supplied preloaded
 - search combines session metadata/prefix text with prompt-history matches from `history.db` after a short debounce
 - mouse wheel changes selection and left click selects in the fullscreen picker
-- Delete, or Backspace with an empty search, opens confirmation and deletes the JSONL plus session artifacts
+- `app.session.delete` (Backspace or Delete by default) opens confirmation and deletes the JSONL plus session artifacts; a bound key that also deletes backward edits a typed search first
 
 ## Interactive in-session picker (`SelectorController.showSessionSelector`)
 
@@ -154,7 +154,7 @@ Flow:
 
 - Up/Down and Page Up/Page Down navigation (clamped, not wrapped)
 - Enter to select
-- Delete, or Backspace on an empty search, to delete after confirmation
+- `app.session.delete` (Backspace or Delete by default; Backspace edits a typed search first) to delete after confirmation
 - Esc to cancel; Ctrl+C to exit
 - Tab to toggle current-folder / all-projects scope
 - mouse wheel/click in the fullscreen picker
@@ -182,11 +182,11 @@ Lifecycle/state transition:
 7. emit `session_switch`, replace messages, reset advisor session state, and sync todos
 8. close provider sessions for a different session, or for a same-session reload whose replay changed
 9. apply the resolved model, or the caller's explicit `model`
-10. if the loaded branch ended with an interrupted tool flow, append a synthetic abort message and rebuild display context
-11. restore configured thinking (`auto` survives as auto) and per-family service tiers, falling back to current settings when no corresponding entry exists
-12. reset memory/tool session state as required, reconnect listeners, run mode reconciliation, and refresh the workspace-aware base system prompt
-13. restore advisor cost for a different session, finish the bash transition, notify session-change callbacks, and return `true` on success
-`switchSession()` returns `false` when a before-switch hook cancels or cwd policy rejects the transition. A cross-project switch without a cwd-change callback is rejected rather than silently adopting the target cwd; callback rejection is also cancellation.
+10.   if the loaded branch ended with an interrupted tool flow, append a synthetic abort message and rebuild display context
+11.   restore configured thinking (`auto` survives as auto) and per-family service tiers, falling back to current settings when no corresponding entry exists
+12.   reset memory/tool session state as required, reconnect listeners, run mode reconciliation, and refresh the workspace-aware base system prompt
+13.   restore advisor cost for a different session, finish the bash transition, notify session-change callbacks, and return `true` on success
+      `switchSession()` returns `false` when a before-switch hook cancels or cwd policy rejects the transition. A cross-project switch without a cwd-change callback is rejected rather than silently adopting the target cwd; callback rejection is also cancellation.
 
 Failures after the snapshot restore the previous manager and runtime state, reconnect/reconcile it, and mark the bash transition failed. Cwd-policy rejection returns `false`; other failures rethrow. Mode-reconciliation and base-prompt-refresh failures on the success path are logged without rolling back the switch.
 

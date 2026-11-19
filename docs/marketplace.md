@@ -32,8 +32,8 @@ On first XDG registry resolution, an existing config-root `marketplaces.json` is
 
 ### Interactive mode
 
-| Command        | Effect                                    |
-| -------------- | ----------------------------------------- |
+| Command                                  | Effect                                    |
+| ---------------------------------------- | ----------------------------------------- |
 | `/marketplace` or `/marketplace install` | Open interactive plugin browser (install) |
 
 ### Marketplace management
@@ -55,8 +55,8 @@ On first XDG registry resolution, an existing config-root `marketplaces.json` is
 | `/marketplace installed`                                                  | List installed marketplace plugins                 |
 | `/marketplace upgrade [--scope user\|project] [name@marketplace]`         | Upgrade one or all plugins                         |
 | `/plugins list`                                                           | List npm/link and marketplace plugins              |
-| `/plugins enable [--scope user\|project] <plugin>`                         | Enable an npm/link or marketplace plugin           |
-| `/plugins disable [--scope user\|project] <plugin>`                        | Disable an npm/link or marketplace plugin          |
+| `/plugins enable [--scope user\|project] <plugin>`                        | Enable an npm/link or marketplace plugin           |
+| `/plugins disable [--scope user\|project] <plugin>`                       | Disable an npm/link or marketplace plugin          |
 
 ### CLI equivalents
 
@@ -101,38 +101,38 @@ A marketplace catalog lives at `.omp-plugin/marketplace.json` in the repository 
 
 ```json
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "my-marketplace",
-  "owner": {
-    "name": "Your Name",
-    "email": "you@example.com"
-  },
-  "metadata": {
-    "description": "A collection of plugins",
-    "version": "1.0.0",
-    "pluginRoot": "plugins"
-  },
-  "plugins": [
-    {
-      "name": "my-plugin",
-      "description": "What this plugin does",
-      "source": "./my-plugin",
-      "category": "development",
-      "homepage": "https://github.com/you/my-plugin"
-    }
-  ]
+	"$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+	"name": "my-marketplace",
+	"owner": {
+		"name": "Your Name",
+		"email": "you@example.com"
+	},
+	"metadata": {
+		"description": "A collection of plugins",
+		"version": "1.0.0",
+		"pluginRoot": "./plugins"
+	},
+	"plugins": [
+		{
+			"name": "my-plugin",
+			"description": "What this plugin does",
+			"source": "./plugins/my-plugin",
+			"category": "development",
+			"homepage": "https://github.com/you/my-plugin"
+		}
+	]
 }
 ```
 
 ### Required fields
 
-| Field        | Description                                                                                                      |
-| ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| Field        | Description                                                                                                          |
+| ------------ | -------------------------------------------------------------------------------------------------------------------- |
 | `name`       | Marketplace name. ASCII letters, digits, hyphens, and dots. Must start and end with a letter or digit. Max 64 chars. |
-| `owner.name` | Marketplace owner name                                                                                           |
-| `plugins`    | Array of plugin entries                                                                                          |
+| `owner.name` | Marketplace owner name                                                                                               |
+| `plugins`    | Array of plugin entries                                                                                              |
 
-Top-level `metadata.description`, `metadata.version`, and `metadata.pluginRoot` are optional. When `metadata.pluginRoot` is set, it is prepended to relative plugin `source` paths.
+Top-level `metadata.description`, `metadata.version`, and `metadata.pluginRoot` are optional. `metadata.pluginRoot` names the directory that bare-name plugin sources (`"my-plugin"`) resolve under; a source that starts with `./` resolves from the marketplace root. Catalogs written for omp's earlier rule, where `pluginRoot` was prefixed to `./` sources, keep installing: a `./` source absent or not a directory at the root is tried under `pluginRoot`. Other filesystem errors stop validation.
 
 Install version resolution tries catalog `version`, `.claude-plugin/plugin.json`, root `plugin.json`, then `package.json`; it then falls back to the source definition's first seven SHA characters or `0.0.0`. Versions used in cache paths must be 1–128 ASCII letters/digits or `._+-` and cannot contain `..`.
 
@@ -161,12 +161,18 @@ Install version resolution tries catalog `version`, `.claude-plugin/plugin.json`
 
 ### Plugin source formats
 
-The `source` field supports these formats. String sources must start with `./` and are resolved inside the marketplace root, after optional `metadata.pluginRoot` is prepended:
+The `source` field supports these formats. String sources must start with `./`, or be a bare name when `metadata.pluginRoot` is set, and are resolved inside the marketplace root:
 
-**Relative path** (within the marketplace repo):
+**Relative path** (within the marketplace repo, from its root):
 
 ```json
-"source": "./my-plugin"
+"source": "./plugins/my-plugin"
+```
+
+**Bare name** (a single directory name under `metadata.pluginRoot`; `"my-plugin"` with `"pluginRoot": "./plugins"` is `./plugins/my-plugin`):
+
+```json
+"source": "my-plugin"
 ```
 
 **Git repository URL**:

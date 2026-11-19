@@ -222,7 +222,12 @@ export function normalizeMCPTransportError(
 		normalizedCode === "CONNECTIONREFUSED" ||
 		normalizedCode === "ENETUNREACH" ||
 		normalizedCode === "EHOSTUNREACH" ||
-		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH)\b/i.test(message)
+		normalizedCode === "ENOTFOUND" ||
+		normalizedCode === "EAI_AGAIN" ||
+		normalizedCode === "FAILEDTOOPENSOCKET" ||
+		/\b(?:ECONNREFUSED|ConnectionRefused|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|FailedToOpenSocket)\b/i.test(
+			message,
+		)
 	) {
 		failure = "connect";
 		retryable = true;
@@ -276,7 +281,7 @@ function nextStep(error: MCPTransportError): string {
 		case "connect":
 			return "Check that the MCP server is running and reachable, then retry.";
 		case "timeout":
-			return "Check server health or increase the MCP timeout; the request outcome is unknown.";
+			return "Raise this server's `timeout` (ms) in its MCP config or set OMP_MCP_TIMEOUT_MS; the request outcome is unknown.";
 		case "eof":
 		case "reset":
 			return error.transport === "stdio"

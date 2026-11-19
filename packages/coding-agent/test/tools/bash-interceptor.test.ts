@@ -1,12 +1,14 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { BashInterceptorRule } from "@oh-my-pi/pi-coding-agent/exec/settings";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { DEFAULT_BASH_INTERCEPTOR_RULES } from "@oh-my-pi/pi-coding-agent/exec/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { checkBashInterception } from "@oh-my-pi/pi-coding-agent/tools/bash-interceptor";
-import { DEFAULT_BASH_INTERCEPTOR_RULES } from "@oh-my-pi/pi-coding-agent/exec/settings";
 
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
@@ -244,15 +246,19 @@ describe("default echo/printf redirect rule", () => {
 		for (const command of [
 			"echo $(printf foo; printf bar) > out.txt",
 			"echo `date; ls` > out.txt",
+			// oxlint-disable-next-line no-template-curly-in-string -- literal shell/JS text under test
 			"echo ${x:-a;b} > out.txt",
 			"echo $(ls > /dev/null) > out.txt",
+			// oxlint-disable-next-line no-template-curly-in-string -- literal shell/JS text under test
 			"echo ${a:-${b}} > out.txt",
 			"echo $(( (1 + 2) * 3 )) > out.txt",
+			// oxlint-disable-next-line no-template-curly-in-string -- literal shell/JS text under test
 			"printf %s ${HOME:-${USER}} >> out.txt",
 		]) {
 			expect(checkBashInterception(command, tools, DEFAULT_BASH_INTERCEPTOR_RULES).suggestedTool).toBe("write");
 		}
 		expect(checkBashInterception("echo $(ls) ; ls > f", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(false);
+		// oxlint-disable-next-line no-template-curly-in-string -- literal shell/JS text under test
 		expect(checkBashInterception("echo ${a:-${b}}; ls 2>e.log", tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(
 			false,
 		);
@@ -264,6 +270,7 @@ describe("default echo/printf redirect rule", () => {
 	it("matches commands with many stderr sinks without exponential backtracking", () => {
 		const start = performance.now();
 		const echo = checkBashInterception(
+			// oxlint-disable-next-line no-template-curly-in-string -- literal shell/JS text under test
 			"echo hi" + " 2>/dev/null 2>>/dev/null 2>&1 \\; <&0 $(a; b) `c; d` ${e:-f;g}".repeat(20),
 			["write"],
 			DEFAULT_BASH_INTERCEPTOR_RULES,
@@ -380,5 +387,54 @@ describe("BashTool argument validation", () => {
 		await expect(tool.execute("tool-call", args as unknown as BashToolInput)).rejects.toThrow(
 			"Async bash execution is disabled",
 		);
+	});
+});
+
+describe("pre-approval refusal gate", () => {
+	const createSession = (settingsOverrides: Record<string, unknown> = {}, toolNames = ["read", "grep", "bash"]) =>
+		({
+			cwd: process.cwd(),
+			hasUI: true,
+			getSessionFile: () => null,
+			isToolActive: (name: string) => toolNames.includes(name),
+			getToolContext: () => ({ toolNames, hasUI: true, ui: {} }) as unknown as AgentToolContext,
+			settings: Settings.isolated({
+				"async.enabled": true,
+				"launch.enabled": true,
+				"bashInterceptor.enabled": true,
+				"bashInterceptor.patterns": DEFAULT_BASH_INTERCEPTOR_RULES,
+				...settingsOverrides,
+			}),
+		}) as unknown as ToolSession;
+
+	const makeWrapper = (tool: BashTool, select: () => Promise<string>, hasUI = true, rewrittenCommand?: string) => {
+		const runner = {
+			hasHandlers: (event: string) => rewrittenCommand !== undefined && event === "tool_call",
+			emitToolCall: async () => (rewrittenCommand ? { input: { command: rewrittenCommand } } : undefined),
+			consumeToolCallEmitted: () => false,
+			hasUI: () => hasUI,
+			getUIContext: () => ({ select }),
+			hasSessionApproval: () => false,
+			sessionId: "bash-approval-test",
+			cwd: process.cwd(),
+			runScoped: <T>(fn: () => T): T => fn(),
+		} as unknown as ExtensionRunner;
+		return new ExtensionToolWrapper(tool as Tool, runner);
+	};
+
+	const alwaysAskCtx = {
+		settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+		toolNames: ["read", "grep", "bash"],
+	} as unknown as AgentToolContext;
+
+	it("rejects an intercepted command in always-ask mode without prompting", async () => {
+		const select = vi.fn(async () => "Approve");
+		const wrapper = makeWrapper(new BashTool(createSession()), select);
+
+		await expect(
+			wrapper.execute("call-1", { command: "cat package.json" }, undefined, undefined, alwaysAskCtx),
+		).rejects.toThrow("Use the `read` tool instead of cat/head/tail");
+
+		expect(select).not.toHaveBeenCalled();
 	});
 });

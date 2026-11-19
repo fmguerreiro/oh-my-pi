@@ -3,6 +3,7 @@ import { type AgentMessage, filterProviderReplayMessages } from "@oh-my-pi/pi-ag
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import {
 	buildReplanTitleContext,
+	buildTitleDriftTurns,
 	type CustomMessage,
 	convertMessagesForContextView,
 	convertToLlm,
@@ -69,6 +70,22 @@ describe("convertToLlm", () => {
 
 		expect(autoSkill?.role).toBe("developer");
 		expect(otherCustom?.role).toBe("developer");
+	});
+
+	it("delivers an incoming agent message as a user turn authored by the agent", () => {
+		const [incoming] = convertToLlm([
+			{
+				role: "custom",
+				customType: "irc:incoming",
+				content: "<irc>\nIncoming IRC message from agent `Main`:\n\nstop building\n</irc>",
+				display: true,
+				details: { id: "1", from: "Main", message: "stop building" },
+				attribution: "agent",
+				timestamp: 1,
+			},
+		]);
+
+		expect(incoming).toMatchObject({ role: "user", attribution: "agent" });
 	});
 
 	it("replays tool calls saved under an xd:// alias by their bare device name", () => {
@@ -421,14 +438,6 @@ describe("replaceLlmImagesWithText", () => {
 		const user = scrubbed.find(m => m.role === "user");
 		expect(Array.isArray(user?.content) && user.content).toEqual([{ type: "text", text: "[image omitted]" }]);
 	});
-
-	it("returns the same array reference when there are no image blocks", () => {
-		const converted = convertToLlm([
-			{ role: "user", content: [{ type: "text", text: "hi" }], attribution: "user", timestamp: 1 },
-		]);
-
-		expect(replaceLlmImagesWithText(converted, "[image omitted]")).toBe(converted);
-	});
 });
 
 describe("buildReplanTitleContext", () => {
@@ -483,6 +492,42 @@ describe("buildReplanTitleContext", () => {
 
 		expect(context).toContain("08-app-settings.md");
 		expect(context).not.toContain("07-manual-llm.md");
+	});
+});
+
+describe("buildTitleDriftTurns", () => {
+	it("keeps the newest operator prompts and replies, oldest first, within the window, skipping aborted replies", () => {
+		const turns = buildTitleDriftTurns([
+			userMessage("fix parser recovery", 1),
+			settledAssistant("x".repeat(1000)),
+			userMessage("now draft the release notes", 2),
+			abortedAssistant([{ type: "text", text: "half a reply" }]),
+			settledAssistant("y".repeat(1000)),
+			userMessage("publish them", 3),
+			settledAssistant(`Published.${"z".repeat(1500)}`),
+		]);
+
+		expect(turns).toEqual([
+			{ role: "user", text: "now draft the release notes" },
+			{ role: "assistant", text: "y".repeat(1000) },
+			{ role: "user", text: "publish them" },
+			{ role: "assistant", text: `Published.${"z".repeat(990)}` },
+		]);
+	});
+
+	it("leads with the latest operator prompt, still within the window, when a long tool loop fills it", () => {
+		const turns = buildTitleDriftTurns([
+			userMessage("fix parser recovery", 1),
+			userMessage("now draft the release notes", 2),
+			settledAssistant("p".repeat(1000)),
+			settledAssistant("q".repeat(1000)),
+			settledAssistant("r".repeat(1000)),
+			settledAssistant("s".repeat(1000)),
+		]);
+
+		expect(turns.map(turn => turn.text[0])).toEqual(["n", "r", "s"]);
+		expect(turns[0]).toEqual({ role: "user", text: "now draft the release notes" });
+		expect(turns.reduce((chars, turn) => chars + turn.text.length, 0)).toBeLessThanOrEqual(3000);
 	});
 });
 

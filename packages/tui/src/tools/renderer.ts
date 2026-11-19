@@ -3,7 +3,7 @@
  * transcript components. Built-in renderers live beside this file; the
  * coding-agent tools implement the matching `*Details` payloads.
  */
-import type { TspPreview, TspText, TspTone, TspToolProps } from "@oh-my-pi/pi-wire";
+import type { ShellTrace, ShellVizPresentation, TspPreview, TspText, TspTone, TspToolProps } from "@oh-my-pi/pi-wire";
 import type { NativeChild } from "../native/node";
 import type { Component } from "../tui";
 import type { Theme } from "../theme/theme";
@@ -37,6 +37,18 @@ export interface RenderResultOptions {
 	cancelled?: boolean;
 	/** The native host shows files by path (`cx.supports("media")`). Native describe hooks only. */
 	media?: boolean;
+	/** The native host draws raw JSON values (`cx.supports("json")`). Native describe hooks only. */
+	json?: boolean;
+	/** The native host draws a live shell trace (`cx.supports("shell")`). Native describe hooks only. */
+	shell?: boolean;
+	/** The native host shows running agents and jobs in its tray (`cx.feature("tray")`). Native describe hooks only. */
+	tray?: boolean;
+	/** Native semantic presentation, decoded and cached by the tool component. */
+	shellPresentation?: ShellVizPresentation;
+	/** Validated immutable trace associated with shellPresentation. */
+	shellTrace?: ShellTrace;
+	/** Explicit seeks/resets change this epoch; ordinary playback ticks do not. */
+	shellReplayEpoch?: number;
 }
 
 /** Render options for a result, plus the tool-specific context the transcript threads through. */
@@ -137,6 +149,8 @@ export interface NativeToolView {
 	readonly preview?: TspPreview | { readonly tail: number } | "none" | "children";
 	/** Starts expanded whatever the transcript's expand state (the todo checklist); the user can still fold it. */
 	readonly open?: boolean;
+	/** Starts collapsed whatever the transcript's expand state (what the tray already shows); the user can still unfold it. */
+	readonly folded?: boolean;
 	/** Render frameless (`frame:"inline"`): a head line plus a disclosed body. */
 	readonly inline?: boolean;
 	/** Head actions offered on hover (`copy`, `retry`). */

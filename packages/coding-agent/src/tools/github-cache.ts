@@ -8,7 +8,8 @@
  *   helpers swallow open/IO failures and degrade to "no cache" so a corrupt or
  *   unreadable DB never blocks a `gh` call.
  *
- *   Soft TTL → return cached row directly.
+ *   Soft TTL → return cached row directly. An open issue/PR row stays fresh for at
+ *     most OPEN_STATE_SOFT_TTL_MS, since a merge or close can land at any moment.
  *   Stateful issue/PR rows past soft TTL but within hard TTL → refresh
  *     synchronously, falling back to the cached row if the live fetch fails.
  *   Expensive PR diff rows past soft TTL but within hard TTL → return cached
@@ -65,6 +66,14 @@ interface Row {
 
 let cachedDb: Database | null = null;
 let openAttempted = false;
+
+/**
+ * Bumped by every invalidation. A fetch that started before a bump returns its
+ * result but does not cache it, so a pre-mutation response cannot repopulate a
+ * row the mutation just dropped. Fencing every in-flight fetch, not only the
+ * matching rows, is deliberate: a skipped store costs one refetch.
+ */
+let invalidationEpoch = 0;
 
 function ensureParentDir(filePath: string): void {
 	try {
@@ -595,6 +604,7 @@ export function invalidate(
 	includeComments?: boolean,
 	authKey: string = DEFAULT_CACHE_AUTH_KEY,
 ): void {
+	invalidationEpoch++;
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -627,6 +637,7 @@ export function invalidate(
  * be far more expensive than a write-amplified DELETE.
  */
 export function invalidateAllForNumber(number: number, repo?: string): void {
+	invalidationEpoch++;
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -642,6 +653,7 @@ export function invalidateAllForNumber(number: number, repo?: string): void {
 
 /** Drop every cached row. Test helper. */
 export function clearAll(): void {
+	invalidationEpoch++;
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -659,6 +671,7 @@ export function clearAll(): void {
  * be identified. Over-invalidation is deliberate (see module header).
  */
 export function invalidateAllForRepo(repo?: string): void {
+	invalidationEpoch++;
 	const db = openDb();
 	if (!db) return;
 	try {
@@ -672,11 +685,25 @@ export function invalidateAllForRepo(repo?: string): void {
 	}
 }
 
+/** Drop live PR rows after a push, leaving issues and retained snapshots alone. */
+export function invalidatePullRequestsForRepo(repo: string): void {
+	invalidationEpoch++;
+	const normalized = normalizeRepo(repo);
+	const db = openDb();
+	if (!db) return;
+	try {
+		db.query("DELETE FROM github_view_cache WHERE repo = ? AND kind IN ('pr', 'pr-diff')").run(normalized);
+	} catch (err) {
+		logger.debug("github cache: invalidatePullRequestsForRepo failed", { err: String(err) });
+	}
+}
+
 /**
  * Test/maintenance helper. Closes and forgets the cached connection so the
  * next access reopens against (possibly) a different DB path.
  */
 export function resetForTests(): void {
+	invalidationEpoch++;
 	if (cachedDb) {
 		try {
 			cachedDb.close();
@@ -769,6 +796,22 @@ function storeResult<T>(
 	});
 }
 
+async function fetchAndStore<T>(
+	authKey: string,
+	repo: string,
+	kind: CacheKind,
+	number: number,
+	includeComments: boolean,
+	fetchFresh: () => Promise<FreshResult<T>>,
+	status: "miss" | "refreshed",
+): Promise<CacheLookupResult<T>> {
+	const epoch = invalidationEpoch;
+	const fresh = await fetchFresh();
+	const fetchedAt = Date.now();
+	if (epoch === invalidationEpoch) storeResult(authKey, repo, kind, number, includeComments, fresh, fetchedAt);
+	return { ...fresh, status, fetchedAt };
+}
+
 /**
  * In-flight background refreshes keyed by row identity. N concurrent stale
  * reads of the same row must spawn one `gh` subprocess, not N identical ones.
@@ -787,10 +830,7 @@ function scheduleBackgroundRefresh<T>(
 	if (inflightRefreshes.has(key)) return;
 	inflightRefreshes.add(key);
 	queueMicrotask(() => {
-		fetchFresh()
-			.then(fresh => {
-				storeResult(authKey, repo, kind, number, includeComments, fresh, Date.now());
-			})
+		fetchAndStore(authKey, repo, kind, number, includeComments, fetchFresh, "refreshed")
 			.catch(err => {
 				logger.debug("github cache: background refresh failed", {
 					err: String(err),
@@ -803,6 +843,19 @@ function scheduleBackgroundRefresh<T>(
 				inflightRefreshes.delete(key);
 			});
 	});
+}
+
+/**
+ * How long a cached issue or PR that was still open stays fresh. It can be merged, closed or reopened at any
+ * moment (often by the agent itself, outside this tool), so it is revalidated well before the configured soft TTL.
+ */
+const OPEN_STATE_SOFT_TTL_MS = 15_000;
+
+/** Whether `payload` is an open issue/PR view, whose state can still change. */
+function isOpenView(kind: CacheKind, payload: unknown): boolean {
+	if (kind !== "issue" && kind !== "pr") return false;
+	const state = payload !== null && typeof payload === "object" ? (payload as { state?: unknown }).state : undefined;
+	return typeof state === "string" && state.toUpperCase() === "OPEN";
 }
 
 export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise<CacheLookupResult<T>> {
@@ -830,12 +883,15 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 
 	if (cached) {
 		const age = now - cached.fetchedAt;
+		const softMs = isOpenView(options.kind, cached.payload)
+			? Math.min(ttl.softMs, OPEN_STATE_SOFT_TTL_MS)
+			: ttl.softMs;
 		if (age > ttl.hardMs) {
 			// Past hard TTL: drop the row eagerly so the on-disk exposure window
 			// is bounded even if `fetchFresh()` then fails (network down, gh
 			// auth lapse, etc.) and we never get to overwrite it.
 			invalidate(options.repo, options.kind, options.number, options.includeComments, authKey);
-		} else if (age <= ttl.softMs) {
+		} else if (age <= softMs) {
 			return {
 				rendered: cached.rendered,
 				sourceUrl: cached.sourceUrl,
@@ -861,10 +917,15 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 			};
 		} else {
 			try {
-				const fresh = await options.fetchFresh();
-				const fetchedAt = Date.now();
-				storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
-				return { ...fresh, status: "refreshed", fetchedAt };
+				return await fetchAndStore(
+					authKey,
+					options.repo,
+					options.kind,
+					options.number,
+					options.includeComments,
+					options.fetchFresh,
+					"refreshed",
+				);
 			} catch (err) {
 				if (err instanceof ToolAbortError) throw err;
 				logger.debug("github cache: synchronous refresh failed; returning stale view", {
@@ -884,10 +945,15 @@ export async function getOrFetchView<T>(options: CacheLookupOptions<T>): Promise
 		}
 	}
 
-	const fresh = await options.fetchFresh();
-	const fetchedAt = Date.now();
-	storeResult(authKey, options.repo, options.kind, options.number, options.includeComments, fresh, fetchedAt);
-	return { ...fresh, status: "miss", fetchedAt };
+	return fetchAndStore(
+		authKey,
+		options.repo,
+		options.kind,
+		options.number,
+		options.includeComments,
+		options.fetchFresh,
+		"miss",
+	);
 }
 
 /**

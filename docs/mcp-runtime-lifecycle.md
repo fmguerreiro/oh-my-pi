@@ -29,6 +29,7 @@ This document describes how MCP servers are discovered, connected, exposed as to
 Both paths:
 
 - pass `authStorage`, cache storage, `mcp.startupTimeoutMs`, and `mcp.enableProjectConfig`; browser-MCP filtering requires `browser.enabled`, registered and active Eval, and an unrestricted session,
+- pass the built-in transform context unless `mcp.builtinTransforms` is off: whether Eval is registered, active and allowed to run JavaScript (`eval.js`),
 - always set `filterExa: true`,
 - log per-server load/connect errors,
 - store the manager in `toolSession.mcpManager` and the session result.
@@ -93,7 +94,7 @@ For each discovered server in `connectServers()`:
 7. wire HTTP OAuth refresh and transport `onClose` reconnect handling,
 8. call `listTools(connection)`,
 9. cache tool definitions (`MCPToolCache.set`) best-effort,
-10. best-effort load resources, resource templates, prompts, and subscriptions after tools load.
+10.   best-effort load resources, resource templates, prompts, and subscriptions after tools load.
 
 `connectToServer()` behavior (`src/mcp/client.ts`):
 
@@ -118,8 +119,8 @@ After the startup window:
 - fulfilled tasks become live `MCPTool`s,
 - rejected tasks produce per-server errors,
 - still-pending tasks:
-  - use cached tool definitions if available (`MCPToolCache.get`) to create `DeferredMCPTool`s,
-  - otherwise contribute no tools at startup; they stay in flight, and the background continuation registers their tools via `#onToolsChanged` once connect/list finishes (a slow server no longer blocks startup — issue #2100).
+   - use cached tool definitions if available (`MCPToolCache.get`) to create `DeferredMCPTool`s,
+   - otherwise contribute no tools at startup; they stay in flight, and the background continuation registers their tools via `#onToolsChanged` once connect/list finishes (a slow server no longer blocks startup — issue #2100).
 
 This is a hybrid startup model: fast return with deferred handles when cache is available, late background registration when it is not.
 
@@ -163,12 +164,14 @@ Both preserve MCP content and metadata; `structuredContent` is retained in `deta
 
 ### Interactive reload and live-change paths
 
-`/mcp reload` (`src/modes/controllers/mcp-command-controller.ts`) does:
+`/mcp reload` (`src/modes/controllers/mcp-command-controller.ts`) runs `reconnectMCPServers` (`src/mcp/reload.ts`), which:
 
 1. `mcpManager.disconnectAll()`,
 2. clears stale MCP prompt commands,
 3. calls `mcpManager.discoverAndConnect()` with the same project/Exa/browser filters as startup,
 4. calls `session.refreshMCPTools(mcpManager.getTools())`.
+
+A working-directory change (`/move`, resuming a session from another project) re-scopes the session-owned manager: `session.refreshProjectScope()` calls `mcpManager.setCwd(newCwd)`, which re-points project config discovery and the advertised `roots/list`, and then runs the same reconnect for every server, since roots are advertised without `listChanged`. The reconnect runs in the background, and the next turn waits for it, bounded, as it does for startup discovery. Reloads are serialized, and the first one waits for startup-deferred discovery to finish.
 
 `session.refreshMCPTools()` delegates to `src/session/session-tools.ts`, which serializes registry mutations, reconciles manager and extension-owned MCP tools, re-wraps the latest tools, and reapplies availability/presentation without restarting. Connected manager tools become enabled; extension-owned MCP tools preserve their previous selection. A failed refresh restores the previous MCP registry. The owning SDK session also installs `setOnToolsChanged`, so late initial connections, server `tools/list_changed` notifications, reconnects, and disconnects can trigger the same rebinding. Explicit `/mcp reconnect <name>` performs one final refresh after the manager reconnect completes.
 
@@ -232,18 +235,18 @@ Top-level sessions own managers they create. `AgentSession.dispose()` disconnect
 
 ## Failure modes and guarantees
 
-| Scenario                                             | Behavior                                                                                                                  | Hard fail vs best-effort       |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| Discovery throws (capability/config load path)       | Loader returns empty tools + synthetic `.mcp.json` error                                                                  | Best-effort session startup    |
-| Invalid server config                                | Server skipped with validation error entry                                                                                | Best-effort per server         |
-| Connect timeout/init failure                         | Server error recorded; others continue                                                                                    | Best-effort per server         |
-| `tools/list` still pending at startup with cache hit | Deferred tools returned immediately                                                                                       | Best-effort fast startup       |
-| `tools/list` still pending at startup without cache  | No tools at startup; background continuation registers them via `#onToolsChanged` when ready                              | Best-effort late registration  |
-| Late background tool-load failure                    | Logged after startup gate                                                                                                 | Best-effort logging            |
-| Runtime dropped transport                            | Manager attempts reconnect; stale tools remain while reconnecting and future calls may retry once or fail with MCP errors | Best-effort automatic recovery |
-| Previously connected remote server still unavailable after retry ladder | Quiet single-attempt probes continue from 15s up to 5-minute intervals until recovery/disconnect/reconfiguration | Best-effort background recovery |
-| More than 5 reconnect invocations within 30s         | Circuit breaker closes/removes the stale connection but leaves tools registered; manual reconnect resets the history      | Automatic reconnect suspended  |
-| Owning session disposal                              | Owned manager disconnect is awaited for up to 3s; failure is logged                                                       | Bounded best-effort cleanup    |
+| Scenario                                                                | Behavior                                                                                                                  | Hard fail vs best-effort        |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| Discovery throws (capability/config load path)                          | Loader returns empty tools + synthetic `.mcp.json` error                                                                  | Best-effort session startup     |
+| Invalid server config                                                   | Server skipped with validation error entry                                                                                | Best-effort per server          |
+| Connect timeout/init failure                                            | Server error recorded; others continue                                                                                    | Best-effort per server          |
+| `tools/list` still pending at startup with cache hit                    | Deferred tools returned immediately                                                                                       | Best-effort fast startup        |
+| `tools/list` still pending at startup without cache                     | No tools at startup; background continuation registers them via `#onToolsChanged` when ready                              | Best-effort late registration   |
+| Late background tool-load failure                                       | Logged after startup gate                                                                                                 | Best-effort logging             |
+| Runtime dropped transport                                               | Manager attempts reconnect; stale tools remain while reconnecting and future calls may retry once or fail with MCP errors | Best-effort automatic recovery  |
+| Previously connected remote server still unavailable after retry ladder | Quiet single-attempt probes continue from 15s up to 5-minute intervals until recovery/disconnect/reconfiguration          | Best-effort background recovery |
+| More than 5 reconnect invocations within 30s                            | Circuit breaker closes/removes the stale connection but leaves tools registered; manual reconnect resets the history      | Automatic reconnect suspended   |
+| Owning session disposal                                                 | Owned manager disconnect is awaited for up to 3s; failure is logged                                                       | Bounded best-effort cleanup     |
 
 ## Public API surface
 

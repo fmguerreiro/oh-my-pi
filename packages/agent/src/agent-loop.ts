@@ -53,7 +53,7 @@ import {
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { isDsmlLeakRecoveryTarget, removeDsmlToolMarkupLeak } from "@oh-my-pi/pi-ai/utils/dsml-leak";
-import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { LiveSteeringChannel } from "./live-steering";
 import { agentPauseGate } from "./pause";
@@ -102,6 +102,7 @@ import type {
 	SteeringInterruptSource,
 	SteeringQueueState,
 	StreamFn,
+	ToolApprovalDecision,
 } from "./types";
 import {
 	ASIDE_MESSAGE_COMMIT,
@@ -109,7 +110,24 @@ import {
 	isSoftToolRequirement,
 	SPECULATIVE_STREAM_SESSION,
 } from "./types";
-import { yieldIfDue } from "./utils/yield";
+
+/**
+ * A tool's batch concurrency for one call: an unset mode is shared, and a
+ * throwing per-call resolver is exclusive — the ordering that cannot race —
+ * rather than taking down the whole batch.
+ */
+export function resolveToolConcurrency(
+	tool: AgentTool<any, any, any> | undefined,
+	args: Record<string, unknown>,
+): "shared" | "exclusive" {
+	const mode = tool?.concurrency;
+	if (typeof mode !== "function") return mode ?? "shared";
+	try {
+		return mode(args);
+	} catch {
+		return "exclusive";
+	}
+}
 
 async function waitForProcessPause(config: AgentLoopConfig, signal?: AbortSignal): Promise<void> {
 	try {
@@ -666,6 +684,26 @@ export function agentLoop(
 }
 
 /**
+ * Whether `message` is kept out of model context: drawn and saved, never sent (a `!!` bash run, a
+ * custom row sent with `excludeFromContext`).
+ */
+export function isExcludedFromContext(message: AgentMessage): boolean {
+	return "excludeFromContext" in message && message.excludeFromContext === true;
+}
+
+/** Index of the last message the model sees, or -1; rows kept out of context after it do not change the request tail. */
+export function lastContextIndex(messages: readonly AgentMessage[]): number {
+	let i = messages.length - 1;
+	while (i >= 0 && isExcludedFromContext(messages[i])) i--;
+	return i;
+}
+
+/** The last message the model sees (see {@link lastContextIndex}). */
+export function lastContextMessage(messages: readonly AgentMessage[]): AgentMessage | undefined {
+	return messages[lastContextIndex(messages)];
+}
+
+/**
  * Trailing assistant message whose runnable tool calls have no results yet.
  *
  * A harness that strips failed/aborted tool results in order to re-execute
@@ -944,7 +982,8 @@ export function normalizeMessagesForProvider(
 	});
 }
 
-const INTENT_FIELD_DESCRIPTION = "concise intent";
+/** Schema description of the injected `i` field when neither `PI_INTENT_DESC` nor the caller sets one. */
+const DEFAULT_INTENT_FIELD_DESCRIPTION = "concise intent";
 const INTENT_SCHEMA_UNION_KEYS = ["anyOf", "oneOf"] as const;
 
 // Memoize injection per input schema identity: normalizeTools runs on every
@@ -954,26 +993,30 @@ const INTENT_SCHEMA_UNION_KEYS = ["anyOf", "oneOf"] as const;
 // the whole catalog per request). The injected object is shared across
 // requests — the same profile as the intent-off path, where parameters IS the
 // shared memoized wire schema (see schema-immutability.test.ts). One stamp
-// key per (mode, describeIntent) variant; index 0 = bare, 1 = described.
-const INTENT_STAMPS = {
-	require: [Symbol("intent:require"), Symbol("intent:require:described")],
-	optional: [Symbol("intent:optional"), Symbol("intent:optional:described")],
-} as const;
+// key per (mode, description) variant, "" keying the bare one: agents in one
+// process may describe `i` differently over the same shared tool schemas.
+const INTENT_STAMPS = { require: new Map<string, symbol>(), optional: new Map<string, symbol>() } as const;
 
 function memoizedInjectIntentIntoSchema(
 	schema: Record<string, unknown>,
 	mode: "require" | "optional",
-	describeIntent: boolean,
+	description: string | undefined,
 ): unknown {
-	return stamp(schema, INTENT_STAMPS[mode][describeIntent ? 1 : 0], host =>
-		injectIntentIntoSchema(host, mode, describeIntent),
-	);
+	const stamps = INTENT_STAMPS[mode];
+	const variant = description ?? "";
+	let key = stamps.get(variant);
+	if (!key) {
+		key = Symbol(`intent:${mode}`);
+		stamps.set(variant, key);
+	}
+	return stamp(schema, key, host => injectIntentIntoSchema(host, mode, description));
 }
 
+/** `schema` with the `i` field first (and required in `require` mode); `description` unset injects it bare. */
 function injectIntentIntoSchema(
 	schema: unknown,
-	mode: "require" | "optional" = "require",
-	describeIntent = true,
+	mode: "require" | "optional",
+	description: string | undefined,
 ): unknown {
 	if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
 	const schemaRecord = schema as Record<string, unknown>;
@@ -996,7 +1039,7 @@ function injectIntentIntoSchema(
 			if (!Array.isArray(variants)) continue;
 			return {
 				...schemaRecord,
-				[key]: variants.map(variant => injectIntentIntoSchema(variant, mode, describeIntent)),
+				[key]: variants.map(variant => injectIntentIntoSchema(variant, mode, description)),
 			};
 		}
 	}
@@ -1020,9 +1063,7 @@ function injectIntentIntoSchema(
 	return {
 		...schemaRecord,
 		properties: {
-			[INTENT_FIELD]: describeIntent
-				? { type: "string", description: INTENT_FIELD_DESCRIPTION }
-				: { type: "string" },
+			[INTENT_FIELD]: description === undefined ? { type: "string" } : { type: "string", description },
 			...properties,
 		},
 		...(mode === "require" ? { required: [...required, INTENT_FIELD] } : {}),
@@ -1032,6 +1073,8 @@ function injectIntentIntoSchema(
 export interface NormalizeToolsOptions {
 	/** Inject the `i` intent field into tool schemas (subject to `PI_NO_INTENT`). */
 	injectIntent: boolean;
+	/** Schema description of the injected `i` field; `PI_INTENT_DESC` overrides it. Default `concise intent`. */
+	intentDescription?: string;
 	/** Strip descriptions from the wire specs when the catalog rides in the system prompt. */
 	pruneDescriptions?: boolean;
 }
@@ -1039,6 +1082,7 @@ export interface NormalizeToolsOptions {
 export function normalizeTools(tools: AgentContext["tools"], options: NormalizeToolsOptions): Context["tools"] {
 	const pruneDescriptions = options.pruneDescriptions === true;
 	const injectIntent = options.injectIntent && Bun.env.PI_NO_INTENT !== "1";
+	const intentDescription = Bun.env.PI_INTENT_DESC || options.intentDescription || DEFAULT_INTENT_FIELD_DESCRIPTION;
 	return tools?.map(t => {
 		const intentMode = resolveIntentMode(t.intent);
 		const doInjectIntent =
@@ -1047,17 +1091,19 @@ export function normalizeTools(tools: AgentContext["tools"], options: NormalizeT
 		// specs without their descriptions (top-level + nested schema annotations)
 		// so they are not duplicated on the wire. Strip the STABLE wire schema (the
 		// memoized `stripSchemaDescriptions` result is reused across requests), then
-		// re-inject `i` (without its hint, which `describeIntent: false` omits) so
+		// re-inject `i` (without its hint, which an unset description omits) so
 		// intent tracing keeps the field while no descriptions ride the wire.
 		if (pruneDescriptions) {
 			const stripped = stripSchemaDescriptions(toolWireSchema(t));
 			const parameters = (
-				doInjectIntent ? memoizedInjectIntentIntoSchema(stripped, intentMode, false) : stripped
+				doInjectIntent ? memoizedInjectIntentIntoSchema(stripped, intentMode, undefined) : stripped
 			) as TSchema;
 			return { ...t, parameters, description: "" };
 		}
 		const wire = toolWireSchema(t);
-		const parameters = (doInjectIntent ? memoizedInjectIntentIntoSchema(wire, intentMode, true) : wire) as TSchema;
+		const parameters = (
+			doInjectIntent ? memoizedInjectIntentIntoSchema(wire, intentMode, intentDescription) : wire
+		) as TSchema;
 		const description = t.description ?? "";
 		const examplesBlock = renderToolExamples({ ...t, parameters }, doInjectIntent ? INTENT_FIELD : undefined);
 		const finalDescription = examplesBlock ? `${description}\n\n${examplesBlock}` : description;
@@ -1070,13 +1116,6 @@ function resolveIntentMode(intent: AgentTool["intent"]): "require" | "optional" 
 	if (intent === "optional" || intent === "omit") return intent;
 	return "require";
 }
-
-/**
- * Longest `i` value accepted as an intent. The injected field is described as
- * a "concise intent" (INTENT_FIELD_DESCRIPTION); anything past this is a tool
- * payload the model put in the wrong field, not a label.
- */
-const MAX_INTENT_LENGTH = 200;
 
 function extractIntent(args: Record<string, unknown>): { intent?: string; strippedArgs: Record<string, unknown> } {
 	const { [INTENT_FIELD]: intent, ...strippedArgs } = args;
@@ -1195,7 +1234,7 @@ function resolveAsides(entries: AsideMessage[] | undefined): AgentMessage[] {
 			if (message) out.push(message);
 		}
 	} catch (error) {
-		discardAsides(out, error instanceof Error ? error : new Error(String(error)));
+		discardAsides(out, toError(error));
 		throw error;
 	}
 	return out;
@@ -1247,6 +1286,25 @@ async function runLoopBody(
 	// `liveAccepted` reached the model inside it, `liveDeferred` did not.
 	let liveAccepted: AgentMessage[] = [];
 	let liveDeferred: AgentMessage[] = [];
+	const endAbortedBeforeModel = async (messages: AgentMessage[], turnOpen: boolean): Promise<boolean> => {
+		if (!signal?.aborted || !config.isUndeliveredQueuedMessage) return false;
+		const undelivered = new Set(messages.filter(message => config.isUndeliveredQueuedMessage?.(message)));
+		for (const list of [currentContext.messages, newMessages]) {
+			for (let i = list.length - 1; i >= 0; i--) {
+				if (undelivered.has(list[i])) list.splice(i, 1);
+			}
+		}
+		if (!turnOpen) stream.push({ type: "turn_start" });
+		emitInputMessages(
+			stream,
+			messages.filter(message => !undelivered.has(message)),
+		);
+		const aborted = emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal);
+		newMessages.push(aborted);
+		await emitTurnEnd(stream, currentContext, aborted, [], config, signal, { willContinue: false });
+		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+		return true;
+	};
 	try {
 		let messagesToEmit = [...initialMessages];
 		if (isDeadlineExceeded(config.deadline)) {
@@ -1260,6 +1318,7 @@ async function runLoopBody(
 		try {
 			pendingMessages = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
 		} catch (error) {
+			if (signal?.aborted && (await endAbortedBeforeModel(messagesToEmit, false))) return;
 			stream.push({ type: "turn_start" });
 			emitInputMessages(stream, messagesToEmit);
 			throw error;
@@ -1336,9 +1395,6 @@ async function runLoopBody(
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 					return;
 				}
-				// Yield at the top of each iteration to prevent busy-wait when
-				// the agent loop is executing tool calls back-to-back.
-				await yieldIfDue();
 				// Park at the turn boundary while the process-wide pause gate is
 				// engaged (host /pause). An external abort releases the park so a
 				// cancelled run still unwinds while everything else stays frozen.
@@ -1361,10 +1417,19 @@ async function runLoopBody(
 
 				let preparedProviderCall: PreparedProviderCall;
 				let gateResult: AgentPreModelCallResult;
+				const emitTurnInputs = () => {
+					emitInputMessages(
+						stream,
+						signal?.aborted
+							? turnMessages.filter(message => !config.isUndeliveredQueuedMessage?.(message))
+							: turnMessages,
+					);
+				};
 				try {
 					if (config.syncContextBeforeModelCall) {
 						await config.syncContextBeforeModelCall(currentContext, signal);
 					}
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 
 					if (!directiveResolvedForTurn) {
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
@@ -1393,16 +1458,19 @@ async function runLoopBody(
 					}
 
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 					preparedProviderCall.liveSteering = openLiveSteering(config, signal, preparedProviderCall);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
+					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
-						emitInputMessages(stream, turnMessages);
+						emitTurnInputs();
 						turnOpen = true;
 					}
 					throw error;
 				}
+				if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
 				if (config.beforeModelCall && signal?.aborted) {
 					gateResult = { stop: true };
 				}
@@ -1446,13 +1514,13 @@ async function runLoopBody(
 
 				if (!turnOpen) {
 					stream.push({ type: "turn_start" });
-					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
+				let inputsEmitted = false;
 				try {
 					if (agentPauseGate.paused) await waitForProcessPause(config, signal);
 					message = await streamAssistantResponse(
@@ -1468,6 +1536,11 @@ async function runLoopBody(
 						hostToolChoice,
 						softRequirementState.forcedToolChoice,
 						preparedProviderCall,
+						() => {
+							if (config.isUndeliveredQueuedMessage) signal?.throwIfAborted();
+							emitTurnInputs();
+							inputsEmitted = true;
+						},
 						message => {
 							const finalToolCalls = message.content.filter(
 								(content): content is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
@@ -1494,6 +1567,10 @@ async function runLoopBody(
 					harmonyRetryAttempt = 0;
 					harmonyTruncateResumeCount = 0;
 				} catch (err) {
+					if (!inputsEmitted) {
+						if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
+						emitTurnInputs();
+					}
 					if (!(err instanceof HarmonyLeakInterruption)) throw err;
 					if (err.recovered) {
 						if (harmonyTruncateResumeCount >= 2) {
@@ -1968,6 +2045,7 @@ async function prepareProviderCall(
 		config.appendOnlyContext.syncMessages(normalizedMessages);
 		llmContext = config.appendOnlyContext.build(context, {
 			intentTracing: !!config.intentTracing,
+			intentDescription: config.intentDescription,
 			pruneToolDescriptions,
 		});
 	} else {
@@ -1976,10 +2054,14 @@ async function prepareProviderCall(
 			messages: normalizedMessages,
 			tools: normalizeTools(context.tools, {
 				injectIntent: !!config.intentTracing,
+				intentDescription: config.intentDescription,
 				pruneDescriptions: pruneToolDescriptions,
 			}),
 		};
 	}
+	// Before the transform too, so a request-size clamp in it measures the withdrawn definitions the provider
+	// re-declares; recomputed below against what the transform returns.
+	if (config.sentToolDefinitions) llmContext = config.sentToolDefinitions.withInactiveTools(llmContext);
 	if (config.transformProviderContext) {
 		llmContext = await config.transformProviderContext(llmContext, model);
 	}
@@ -1995,10 +2077,9 @@ async function prepareProviderCall(
 		};
 	}
 	// After `transformProviderContext`, so the recorded definitions are exactly what the provider receives.
-	if (config.sentToolDefinitions && llmContext.tools) {
-		config.sentToolDefinitions.record(llmContext.tools);
-		const inactiveTools = config.sentToolDefinitions.inactiveFor(llmContext.messages, llmContext.tools);
-		if (inactiveTools) llmContext = { ...llmContext, inactiveTools };
+	if (config.sentToolDefinitions) {
+		if (llmContext.tools) config.sentToolDefinitions.record(llmContext.tools);
+		llmContext = config.sentToolDefinitions.withInactiveTools(llmContext);
 	}
 	return { model, context: llmContext, promptToolWireTools, ownedDialect };
 }
@@ -2020,6 +2101,7 @@ async function streamAssistantResponse(
 	hostToolChoice?: ToolChoice,
 	forcedToolChoice?: ToolChoice,
 	prepared?: PreparedProviderCall,
+	onProviderStart?: () => void,
 	canDispatchFinalToolCalls?: (message: AssistantMessage) => boolean,
 ): Promise<AssistantMessage> {
 	const providerCall = prepared ?? (await prepareProviderCall(context, config, signal));
@@ -2164,6 +2246,7 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			onProviderStart?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,
@@ -2378,10 +2461,6 @@ async function streamAssistantResponse(
 					if (requestSignal?.aborted) {
 						return await finishAbortedStream();
 					}
-
-					// Yield to the event loop periodically to prevent busy-wait
-					// when the LLM is streaming chunks faster than the loop can rest.
-					await yieldIfDue();
 
 					if (event.type === "toolcall_start") {
 						const block = event.partial.content[event.contentIndex];
@@ -2790,14 +2869,7 @@ function buildToolCallAbortMessages(
  *  `signal.reason` is the default `AbortError` `DOMException`) falls back to the
  *  generic sentinel that downstream renderers treat as "no specific reason". */
 export function abortReasonText(signal: AbortSignal | undefined): string {
-	const scopedReason = toolScopedAbortReason(signal);
-	if (scopedReason) return scopedReason.message;
-	const reason = signal?.reason;
-	if (typeof reason === "string" && reason.trim().length > 0) return reason;
-	if (reason instanceof Error && reason.name !== "AbortError" && reason.message.trim().length > 0) {
-		return reason.message;
-	}
-	return "Request was aborted";
+	return toolScopedAbortReason(signal)?.message ?? AIError.callerAbortReason(signal) ?? "Request was aborted";
 }
 
 function emitAbortedAssistantMessage(
@@ -3120,11 +3192,6 @@ async function prepareToolCallDispatch(
 				? { intent: undefined, strippedArgs: argsForExecution }
 				: extractIntent(toolCall.arguments);
 			argsForExecution = strippedArgs;
-			if (intent !== undefined && intent.length > MAX_INTENT_LENGTH && tool) {
-				entry.args = strippedArgs;
-				entry.validationErrorMessage = `\`${INTENT_FIELD}\` is a short intent label (at most ${MAX_INTENT_LENGTH} chars); the value you sent is ${intent.length} chars. The tool was not run. Put that content in the tool's own parameters and retry with a brief \`${INTENT_FIELD}\`.`;
-				continue;
-			}
 			if (intent) {
 				toolCall.intent = intent;
 			} else if (typeof tool?.intent === "function") {
@@ -3426,7 +3493,7 @@ async function executeToolCalls(
 		// also cascades: the freshly detached job's own completion re-triggers
 		// this check for the next command, so millisecond-long commands chain
 		// into separate background deliveries (#12869).
-		if (source === "irc" && softInterrupts) steeringSoftController.abort();
+		if (source === "irc" && softInterrupts) steeringSoftController.abort("irc");
 	};
 
 	const checkSteering = async (): Promise<void> => {
@@ -3465,7 +3532,7 @@ async function executeToolCalls(
 				interruptState.triggered = true;
 				interruptState.source = steeringSource ?? "unknown";
 				steeringAbortController.abort(TOOL_INTERRUPT_ABORT_REASON);
-				if (softInterrupts) steeringSoftController.abort();
+				if (softInterrupts) steeringSoftController.abort(interruptState.source);
 			}
 			return;
 		}
@@ -3522,7 +3589,11 @@ async function executeToolCalls(
 		flushResultMessages();
 	};
 
-	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
+	const runTool = async (
+		record: (typeof records)[number],
+		index: number,
+		earlierEffectsSettled: Promise<void> | undefined,
+	): Promise<void> => {
 		// A pending interrupt preempts not-yet-started interruptible tools,
 		// except receivers that drain the wake with an already-aborted signal.
 		// Non-interruptible work is never skipped, whatever the source: the
@@ -3631,7 +3702,7 @@ async function executeToolCalls(
 				if (abortBeforeToolExecution()) return;
 
 				const speculativeOutcome = speculationCoordinator
-					? await speculationCoordinator.claim(tool, toolCall, executionArgs)
+					? await speculationCoordinator.claim(tool, toolCall, executionArgs, earlierEffectsSettled, record.signal)
 					: undefined;
 				if (speculativeOutcome) {
 					// Normalize exactly like the ordinary execute path below: third-party
@@ -3660,6 +3731,7 @@ async function executeToolCalls(
 						toolCalls: toolCallInfos,
 						steeringSignal: steeringSoftController.signal,
 						providerMetadata: toolCall.providerMetadata,
+						...(earlierEffectsSettled ? { earlierEffectsSettled } : {}),
 						addAdditionalContext: context => {
 							if (isNonBlankContext(context)) record.reportedContext.push(context);
 						},
@@ -3800,6 +3872,10 @@ async function executeToolCalls(
 
 	let lastExclusive: Promise<void> = Promise.resolve();
 	let sharedTasks: Promise<void>[] = [];
+	// The shared calls among `sharedTasks` whose approval, asked with the call's
+	// arguments, is not "read": they may change files that a later call running
+	// beside them reads.
+	let sharedEffects: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
 
 	// While tool calls are in flight, queued steering or interrupting IRC would
@@ -3877,25 +3953,17 @@ async function executeToolCalls(
 			: undefined;
 	for (let index = 0; index < records.length; index++) {
 		const record = records[index];
-		const concurrencyMode = record.tool?.concurrency;
-		let concurrency: "shared" | "exclusive";
-		if (typeof concurrencyMode === "function") {
-			// Resolved from the prepared (possibly hook-revised) args — raw args
-			// only when validation failed, and those records error out before
-			// executing. A throwing resolver must not take down the whole batch,
-			// so fall back to the safe (serial) mode.
-			try {
-				concurrency = concurrencyMode(record.args);
-			} catch {
-				concurrency = "exclusive";
-			}
-		} else {
-			concurrency = concurrencyMode ?? "shared";
-		}
+		// Resolved from the prepared (possibly hook-revised) args — raw args
+		// only when validation failed, and those records error out before executing.
+		const concurrency = resolveToolConcurrency(record.tool, record.args);
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
+		const earlierEffectsSettled =
+			concurrency === "shared" && sharedEffects.length > 0
+				? Promise.allSettled(sharedEffects).then(() => undefined)
+				: undefined;
 		const task = start.then(async () => {
 			try {
-				await runTool(record, index);
+				await runTool(record, index, earlierEffectsSettled);
 			} finally {
 				refreshPauseState();
 			}
@@ -3904,8 +3972,23 @@ async function executeToolCalls(
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];
+			sharedEffects = [];
 		} else {
 			sharedTasks.push(task);
+			// A dynamic approval is asked with the prepared arguments, as concurrency
+			// is above, and no context; one that throws, or that says anything but
+			// "read", counts as a call that may write. A resolver that says "write"
+			// only with a context or only for transformed arguments is not counted, so
+			// a read after it returns what it read first.
+			const approval = record.tool?.approval;
+			let decision: ToolApprovalDecision | undefined;
+			try {
+				decision = typeof approval === "function" ? approval(record.args) : approval;
+			} catch {
+				decision = undefined;
+			}
+			const tier = typeof decision === "string" ? decision : (decision?.tier ?? "exec");
+			if (tier !== "read") sharedEffects.push(task);
 		}
 	}
 	try {
@@ -3917,9 +4000,6 @@ async function executeToolCalls(
 		await steeringWatchPromise?.catch(() => undefined);
 		clearInterval(steeringWatchTimer);
 	}
-	// Yield after batch tool execution to let GC and I/O catch up,
-	// especially when tool results are large (e.g. bash output).
-	await yieldIfDue();
 
 	for (const record of records) {
 		if (!record.toolResultMessage) {

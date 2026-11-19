@@ -3,13 +3,7 @@ import type { CompactionSettings } from "@oh-my-pi/pi-agent-core/compaction";
 import { effectiveReserveTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
 import { renderToolExamples } from "@oh-my-pi/pi-ai/dialect";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-
-interface ContextSkill {
-	readonly name: string;
-	readonly description?: string;
-	readonly hide?: boolean;
-}
+import { stripSchemaDescriptions, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 
 type ContextTool = Pick<AiTool, "name" | "description" | "parameters" | "examples">;
 
@@ -48,6 +42,7 @@ export interface ContextUsageSession extends NonMessageTokenSource {
 		| {
 				messagesTokens: number;
 				skillsTokens: number;
+				instructionFilesTokens: number;
 				systemToolsTokens: number;
 				systemContextTokens: number;
 				systemPromptTokens: number;
@@ -59,11 +54,10 @@ export interface ContextUsageSession extends NonMessageTokenSource {
 export interface ContextUsageOptions {
 	compaction: CompactionSettings;
 	sourceRevision?: number;
-	skillful?: boolean;
 	snapcompact?: ContextSavingsEstimate;
 }
 
-type CategoryId = "systemPrompt" | "systemContext" | "systemTools" | "skills" | "messages";
+type CategoryId = "systemPrompt" | "systemContext" | "systemTools" | "instructionFiles" | "skills" | "messages";
 
 interface CategoryInfo {
 	id: CategoryId;
@@ -128,45 +122,79 @@ export interface NonMessageTokenSource {
 		readonly state?: {
 			readonly tools?: readonly ContextTool[];
 		};
+		/**
+		 * Whether requests to `model` ship description-stripped tool specs because
+		 * the catalog rides in the system prompt (`Agent.prunesToolDescriptions`).
+		 */
+		prunesToolDescriptions?(model: Model | undefined): boolean;
 	};
-	readonly skills?: readonly ContextSkill[];
-	/** Provider-facing, session-frozen descriptions when available. */
-	readonly renderedSkills?: readonly ContextSkill[];
+	/** Context files and skills located in the built prompt; see {@link claimPromptSources}. */
+	readonly systemPromptSources?: SystemPromptSources;
 }
 
 /** Shared empty system-prompt part list, avoiding an allocation per render. */
 export const EMPTY_STRING_PARTS: string[] = [];
 const EMPTY_TOOLS: readonly ContextTool[] = [];
-const EMPTY_SKILLS: readonly ContextSkill[] = [];
 
-/**
- * Skills actually rendered into the system prompt, mirroring the filter in
- * `buildSystemPrompt` (`system-prompt.ts`): the `read` tool must be present so
- * the model can fetch skill content, and skills with frontmatter `hide: true`
- * (or `disable-model-invocation`, normalized onto `hide`) are excluded.
- * Accounting must count only these so the Skills category and the System-prompt
- * subtraction stay aligned with the provider-facing prompt.
- */
-function renderedSkills(skills: readonly ContextSkill[], tools: readonly ContextTool[]): readonly ContextSkill[] {
-	if (!tools.some(tool => tool.name === "read")) return EMPTY_SKILLS;
-	return skills.filter(skill => skill.hide !== true);
+/** A context file or skill located in a built system-prompt block. */
+export interface SystemPromptSource {
+	readonly id: string;
+	readonly kind: "instruction-files" | "skills";
+	readonly label: string;
+	readonly path?: string;
+	/** Index of the built block holding this source. */
+	readonly block: number;
+	/** UTF-16 range of the source in that block. */
+	readonly start: number;
+	readonly end: number;
 }
 
-export function estimateSkillsTokens(skills: readonly ContextSkill[], tokenizer: Tokenizer): number {
-	const fragments: string[] = [];
-	for (const skill of skills) {
-		// "- name: description\n" wire framing tokenizes ~identically to the
-		// concatenated form, so encode each piece separately and sum.
-		fragments.push(skill.name, skill.description ?? "");
+/** Sources paired with the blocks they were built into; valid only while those blocks are unchanged. */
+export interface SystemPromptSources {
+	readonly blocks: readonly string[];
+	readonly sources: readonly SystemPromptSource[];
+}
+
+/** Attribution of built sources in an effective system prompt. */
+export interface PromptSourceClaims {
+	/** Sources of each block the effective prompt holds unchanged at its built index, in block order. */
+	readonly byBlock: ReadonlyMap<number, readonly SystemPromptSource[]>;
+	/** Sources left in their block because it changed or moved after the build. */
+	readonly left: readonly SystemPromptSource[];
+}
+
+/**
+ * Attributes each source whose built block the effective prompt still holds unchanged at the same
+ * index. The status line and the `/context` viewer both count sources through this, so they agree.
+ */
+export function claimPromptSources(
+	effective: readonly (string | undefined)[],
+	metadata: SystemPromptSources | undefined,
+): PromptSourceClaims {
+	const byBlock = new Map<number, SystemPromptSource[]>();
+	const left: SystemPromptSource[] = [];
+	if (!metadata) return { byBlock, left };
+	for (const source of metadata.sources) {
+		if (effective[source.block] !== metadata.blocks[source.block]) {
+			left.push(source);
+			continue;
+		}
+		const sources = byBlock.get(source.block) ?? [];
+		sources.push(source);
+		byBlock.set(source.block, sources);
 	}
-	return tokenizer.countTokens(fragments);
+	for (const sources of byBlock.values()) sources.sort((a, b) => a.start - b.start);
+	return { byBlock, left };
 }
 
 type ToolSchemaSource = readonly ContextTool[];
 
 interface ToolSchemaTokenCache {
 	revision: number;
-	byTokenizer: WeakMap<Tokenizer, { revision: number; sourceRevision: number; tokens: number }>;
+	byTokenizer: WeakMap<
+		Tokenizer,
+		{ revision: number; sourceRevision: number; pruneDescriptions: boolean; tokens: number }
+	>;
 }
 
 /**
@@ -216,12 +244,24 @@ export interface ToolSchemaFragments {
 	readonly schemaError?: string;
 }
 
+/** How {@link toolSchemaFragments} renders one tool definition. */
+export interface ToolSchemaFragmentOptions {
+	/** Also return `display`: the same fragments with the schema JSON indented by this many spaces. */
+	displayIndent?: number;
+	/**
+	 * Mirror `normalizeTools({ pruneDescriptions: true })`: the wire spec is the
+	 * name plus the description-stripped schema, with no description or examples.
+	 */
+	pruneDescriptions?: boolean;
+}
+
 /**
  * Provider-visible text of one tool definition. `displayIndent` additionally
  * returns `display`, the same fragments with the schema JSON indented, from
  * the same schema conversion.
  */
-export function toolSchemaFragments(tool: ContextTool, displayIndent?: number): ToolSchemaFragments {
+export function toolSchemaFragments(tool: ContextTool, options: ToolSchemaFragmentOptions = {}): ToolSchemaFragments {
+	const { displayIndent, pruneDescriptions = false } = options;
 	// Extension-supplied tools may carry a non-string name/description or a
 	// parameters value whose wire schema stringifies to `undefined` (e.g. a
 	// callable schema that escaped normalization). A non-string fragment is
@@ -234,7 +274,7 @@ export function toolSchemaFragments(tool: ContextTool, displayIndent?: number): 
 		display?.push(shown);
 	};
 	if (typeof name === "string") push(name);
-	if (typeof description === "string") push(description);
+	if (!pruneDescriptions && typeof description === "string") push(description);
 	try {
 		const wireTool: AiTool = {
 			name,
@@ -242,12 +282,14 @@ export function toolSchemaFragments(tool: ContextTool, displayIndent?: number): 
 			parameters: parameters as AiTool["parameters"],
 			examples: tool.examples,
 		};
-		const wireSchema = toolWireSchema(wireTool) ?? {};
+		const fullSchema = toolWireSchema(wireTool) ?? {};
+		const wireSchema = pruneDescriptions ? stripSchemaDescriptions(fullSchema) : fullSchema;
 		const wireJson = JSON.stringify(wireSchema);
 		if (typeof wireJson === "string")
 			push(wireJson, display ? JSON.stringify(wireSchema, null, displayIndent) : wireJson);
-		// The agent loop appends rendered examples to the wire description.
-		const examplesBlock = renderToolExamples(wireTool);
+		// The agent loop appends rendered examples to the wire description,
+		// which pruning empties.
+		const examplesBlock = pruneDescriptions ? undefined : renderToolExamples(wireTool);
 		if (examplesBlock) push(examplesBlock);
 	} catch (error) {
 		// Schema may contain functions or cycles.
@@ -256,23 +298,41 @@ export function toolSchemaFragments(tool: ContextTool, displayIndent?: number): 
 	return { fragments, display };
 }
 
+/** Inputs that select which tool-schema estimate applies, beyond the roster and tokenizer. */
+export interface ToolSchemaEstimateOptions {
+	/** Caller settings/source revision; a change invalidates the cached estimate. */
+	sourceRevision?: number;
+	/** Count the description-stripped specs sent when the catalog rides in the system prompt. */
+	pruneDescriptions?: boolean;
+}
+
 /**
  * Estimate provider-visible tool-schema tokens.
  *
  * Results are cached by roster-array identity, tokenizer identity, the
- * caller-supplied settings/source revision, and the roster's explicit dynamic
- * metadata revision. Callers whose descriptions or schemas are live getters
- * must either advance `sourceRevision` or call
+ * caller-supplied settings/source revision, the prune mode, and the roster's
+ * explicit dynamic metadata revision. Callers whose descriptions or schemas are
+ * live getters must either advance `sourceRevision` or call
  * {@link invalidateToolSchemaMetadata} when those inputs change.
  */
-export function estimateToolSchemaTokens(tools: ToolSchemaSource, tokenizer: Tokenizer, sourceRevision = 0): number {
+export function estimateToolSchemaTokens(
+	tools: ToolSchemaSource,
+	tokenizer: Tokenizer,
+	options: ToolSchemaEstimateOptions = {},
+): number {
+	const { sourceRevision = 0, pruneDescriptions = false } = options;
 	const cache = toolSchemaTokenCache(tools);
 	const cached = cache.byTokenizer.get(tokenizer);
-	if (cached?.revision === cache.revision && cached.sourceRevision === sourceRevision) return cached.tokens;
+	if (
+		cached?.revision === cache.revision &&
+		cached.sourceRevision === sourceRevision &&
+		cached.pruneDescriptions === pruneDescriptions
+	)
+		return cached.tokens;
 
-	const fragments = tools.flatMap(tool => toolSchemaFragments(tool).fragments);
+	const fragments = tools.flatMap(tool => toolSchemaFragments(tool, { pruneDescriptions }).fragments);
 	const tokens = tokenizer.countTokens(fragments);
-	cache.byTokenizer.set(tokenizer, { revision: cache.revision, sourceRevision, tokens });
+	cache.byTokenizer.set(tokenizer, { revision: cache.revision, sourceRevision, pruneDescriptions, tokens });
 	return tokens;
 }
 
@@ -281,9 +341,9 @@ export function estimateContextToolSchemaTokens(
 	tools: ToolSchemaSource,
 	tokenizer: Tokenizer,
 	model: Model | undefined,
-	sourceRevision = 0,
+	options: ToolSchemaEstimateOptions = {},
 ): number {
-	return model?.toolSchemasInContext === false ? 0 : estimateToolSchemaTokens(tools, tokenizer, sourceRevision);
+	return model?.toolSchemasInContext === false ? 0 : estimateToolSchemaTokens(tools, tokenizer, options);
 }
 
 /**
@@ -293,31 +353,36 @@ export function estimateContextToolSchemaTokens(
  *
  * Exposed so callers like `StatusLineComponent` can cache the non-message
  * total separately from the growing message total. A model switch can change
- * which tool schemas occupy context without changing the roster.
+ * which tool schemas occupy context without changing the roster; a prune-mode
+ * change (`Agent.prunesToolDescriptions`) changes how much of each spec ships.
  */
 // The per-turn threshold and compaction paths call these helpers repeatedly.
-// Cache by prompt, roster, skills, tokenizer, revision, and model schema policy;
-// setSystemPrompt/setTools replace their arrays rather than mutating them.
+// Cache by prompt, prompt sources, roster, tokenizer, revision, model schema policy,
+// and prune mode; setSystemPrompt/setTools replace their arrays rather than mutating them.
 interface NonMessageTokenCache {
 	systemPromptRef: readonly string[];
+	promptSourcesRef: SystemPromptSources | undefined;
 	toolsRef: ToolSchemaSource;
 	toolSchemasInContext: boolean;
+	pruneToolDescriptions: boolean;
 	toolsRevision: number;
 	sourceRevision: number;
-	skillful: boolean;
-	skillsRef: readonly ContextSkill[];
 	// The Agent swaps its Tokenizer instance when the model's encoding changes,
 	// so instance identity doubles as the encoding key.
 	tokenizerRef: Tokenizer;
 	tokens: number | undefined;
-	breakdown:
-		| {
-				skillsTokens: number;
-				toolsTokens: number;
-				systemContextTokens: number;
-				systemPromptTokens: number;
-		  }
-		| undefined;
+	breakdown: NonMessageBreakdown | undefined;
+}
+
+/** Non-message token totals, with instruction files and skills counted through {@link claimPromptSources}. */
+export interface NonMessageBreakdown {
+	skillsTokens: number;
+	instructionFilesTokens: number;
+	toolsTokens: number;
+	/** Blocks after the first, without attributed sources. */
+	systemContextTokens: number;
+	/** The first block, without attributed sources. */
+	systemPromptTokens: number;
 }
 
 const NON_MESSAGE_TOKEN_CACHE = Symbol("non-message-token-cache");
@@ -335,29 +400,31 @@ function nonMessageTokenCacheEntry(
 	const systemPromptRef = session.systemPrompt ?? EMPTY_STRING_PARTS;
 	const toolsRef = session.agent?.state?.tools ?? EMPTY_TOOLS;
 	const toolSchemasInContext = session.model?.toolSchemasInContext !== false;
+	const pruneToolDescriptions = session.agent?.prunesToolDescriptions?.(session.model) === true;
 	const toolsRevision = getToolSchemaMetadataRevision(toolsRef);
-	const skillsRef = session.renderedSkills ?? session.skills ?? EMPTY_SKILLS;
+	const promptSourcesRef = session.systemPromptSources;
 	let entry = cachedSession[NON_MESSAGE_TOKEN_CACHE];
 	if (
 		entry &&
 		entry.systemPromptRef === systemPromptRef &&
 		entry.toolsRef === toolsRef &&
 		entry.toolSchemasInContext === toolSchemasInContext &&
+		entry.pruneToolDescriptions === pruneToolDescriptions &&
 		entry.toolsRevision === toolsRevision &&
 		entry.sourceRevision === sourceRevision &&
-		entry.skillsRef === skillsRef &&
+		entry.promptSourcesRef === promptSourcesRef &&
 		entry.tokenizerRef === tokenizer
 	) {
 		return entry;
 	}
 	entry = {
 		systemPromptRef,
+		promptSourcesRef,
 		toolsRef,
 		toolSchemasInContext,
+		pruneToolDescriptions,
 		toolsRevision,
 		sourceRevision,
-		skillful: true,
-		skillsRef,
 		tokenizerRef: tokenizer,
 		tokens: undefined,
 		breakdown: undefined,
@@ -377,7 +444,10 @@ export function computeNonMessageTokens(
 	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
 	const tokens =
 		tokenizer.countTokens(Array.from(systemPromptParts, part => part ?? "")) +
-		estimateContextToolSchemaTokens(tools, tokenizer, session.model, sourceRevision);
+		estimateContextToolSchemaTokens(tools, tokenizer, session.model, {
+			sourceRevision,
+			pruneDescriptions: entry.pruneToolDescriptions,
+		});
 	entry.tokens = tokens;
 	return tokens;
 }
@@ -392,29 +462,36 @@ export function computeNonMessageBreakdown(
 	session: NonMessageTokenSource,
 	tokenizer: Tokenizer,
 	sourceRevision = 0,
-	skillful = true,
-): {
-	skillsTokens: number;
-	toolsTokens: number;
-	systemContextTokens: number;
-	systemPromptTokens: number;
-} {
+): NonMessageBreakdown {
 	const entry = nonMessageTokenCacheEntry(session, tokenizer, sourceRevision);
-	if (entry.breakdown && entry.skillful === skillful) return entry.breakdown;
+	if (entry.breakdown) return entry.breakdown;
 	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
-	const skillsTokens =
-		skillful === false
-			? 0
-			: estimateSkillsTokens(
-					renderedSkills(session.renderedSkills ?? session.skills ?? EMPTY_SKILLS, tools),
-					tokenizer,
-				);
-	const toolsTokens = estimateContextToolSchemaTokens(tools, tokenizer, session.model, sourceRevision);
+	const toolsTokens = estimateContextToolSchemaTokens(tools, tokenizer, session.model, {
+		sourceRevision,
+		pruneDescriptions: entry.pruneToolDescriptions,
+	});
 	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
-	const systemContextTokens = tokenizer.countTokens(Array.from(systemPromptParts.slice(1), part => part ?? ""));
-	const systemPromptTokens = Math.max(0, tokenizer.countTokens(systemPromptParts[0] ?? "") - skillsTokens);
-	const breakdown = { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
-	entry.skillful = skillful;
+	const { byBlock } = claimPromptSources(systemPromptParts, session.systemPromptSources);
+	let skillsTokens = 0;
+	let instructionFilesTokens = 0;
+	let systemContextTokens = 0;
+	let systemPromptTokens = 0;
+	for (const [index, part] of systemPromptParts.entries()) {
+		const block = part ?? "";
+		let remaining = "";
+		let cursor = 0;
+		for (const source of byBlock.get(index) ?? []) {
+			remaining += block.slice(cursor, source.start);
+			const tokens = tokenizer.countTokens(block.slice(source.start, source.end));
+			if (source.kind === "skills") skillsTokens += tokens;
+			else instructionFilesTokens += tokens;
+			cursor = source.end;
+		}
+		const tokens = tokenizer.countTokens(cursor === 0 ? block : remaining + block.slice(cursor));
+		if (index === 0) systemPromptTokens = tokens;
+		else systemContextTokens += tokens;
+	}
+	const breakdown = { skillsTokens, instructionFilesTokens, toolsTokens, systemContextTokens, systemPromptTokens };
 	entry.breakdown = breakdown;
 	return breakdown;
 }
@@ -432,6 +509,7 @@ export function computeContextBreakdown(session: ContextUsageSession, options: C
 
 	let messagesTokens = 0;
 	let skillsTokens = 0;
+	let instructionFilesTokens = 0;
 	let toolsTokens = 0;
 	let systemContextTokens = 0;
 	let systemPromptTokens = 0;
@@ -440,6 +518,7 @@ export function computeContextBreakdown(session: ContextUsageSession, options: C
 	if (breakdown) {
 		messagesTokens = breakdown.messagesTokens;
 		skillsTokens = breakdown.skillsTokens;
+		instructionFilesTokens = breakdown.instructionFilesTokens;
 		toolsTokens = breakdown.systemToolsTokens;
 		systemContextTokens = breakdown.systemContextTokens;
 		systemPromptTokens = breakdown.systemPromptTokens;
@@ -448,18 +527,26 @@ export function computeContextBreakdown(session: ContextUsageSession, options: C
 		// Category split needs a messages-only number, so this walk stays local:
 		// an anchored total folds the system prompt and tool schemas into it.
 		messagesTokens = tokenizer.countMessages(session.messages ?? []);
-		const nonMessage = computeNonMessageBreakdown(session, tokenizer, options.sourceRevision, options.skillful);
+		const nonMessage = computeNonMessageBreakdown(session, tokenizer, options.sourceRevision);
 		skillsTokens = nonMessage.skillsTokens;
+		instructionFilesTokens = nonMessage.instructionFilesTokens;
 		toolsTokens = nonMessage.toolsTokens;
 		systemContextTokens = nonMessage.systemContextTokens;
 		systemPromptTokens = nonMessage.systemPromptTokens;
-		usedTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens + messagesTokens;
+		usedTokens =
+			skillsTokens +
+			instructionFilesTokens +
+			toolsTokens +
+			systemContextTokens +
+			systemPromptTokens +
+			messagesTokens;
 	}
 
 	const categories: CategoryInfo[] = [
 		{ id: "systemPrompt", label: "System prompt", tokens: systemPromptTokens },
 		{ id: "systemTools", label: "System tools", tokens: toolsTokens },
 		{ id: "systemContext", label: "System context", tokens: systemContextTokens },
+		{ id: "instructionFiles", label: "Instruction files", tokens: instructionFilesTokens },
 		{ id: "skills", label: "Skills", tokens: skillsTokens },
 		{ id: "messages", label: "Messages", tokens: messagesTokens },
 	];

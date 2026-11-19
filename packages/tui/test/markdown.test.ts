@@ -180,6 +180,46 @@ describe("Markdown component", () => {
 			expect(plainLines.every(line => visibleWidth(line) <= 16)).toBe(true);
 		});
 
+		it("keeps task-list checkbox state in the marker and hangs wrapped rows under the task text", () => {
+			const markdown = new Markdown(
+				"- [x] Ship the fix today\n- [ ] Add a regression test",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const plainLines = markdown.render(20).map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(plainLines).toEqual([
+				"- [x] Ship the fix",
+				"      today",
+				"- [ ] Add a",
+				"      regression",
+				"      test",
+			]);
+		});
+
+		it("keeps task checkboxes under custom listBullet themes", () => {
+			const source = "- [x] Ship the fix\n- [ ] Add a test\n\n10. [x] Tag it";
+			// Exact-marker transforms still see the bare `- ` / `10. ` marker.
+			const exactMarkerTheme = {
+				...defaultMarkdownTheme,
+				listBullet: (bullet: string) => (bullet === "- " ? "• " : bullet === "10. " ? "10) " : bullet),
+			};
+			// Marker-replacing callbacks swap the marker, never the checkbox state.
+			const replaceAllTheme = { ...defaultMarkdownTheme, listBullet: () => "• " };
+
+			const exactMarkerLines = new Markdown(source, 0, 0, exactMarkerTheme)
+				.render(40)
+				.map(line => stripVTControlCharacters(line).trimEnd());
+			const replaceAllLines = new Markdown(source, 0, 0, replaceAllTheme)
+				.render(40)
+				.map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(exactMarkerLines).toEqual(["• [x] Ship the fix", "• [ ] Add a test", "", "10) [x] Tag it"]);
+			expect(replaceAllLines).toEqual(["• [x] Ship the fix", "• [ ] Add a test", "", "• [x] Tag it"]);
+		});
+
 		it("keeps list rows within width when the marker consumes the line", () => {
 			const markdown = new Markdown("123456789. x", 0, 0, defaultMarkdownTheme);
 
@@ -2333,6 +2373,40 @@ describe("Module-level LRU render cache", () => {
 		const closed = stripVTControlCharacters(markdown.render(80).join("\n"));
 		expect(closed).toContain("F<def f():>");
 		expect(pushes).toEqual(["def f():\n", "    x = 1\n"]);
+	});
+
+	it("settles an open fence's finished lines so a long block can retire", () => {
+		// A fenced block never reaches a "\n\n" boundary, so the block walk alone
+		// settles nothing for it and a long streamed SQL/log block stays in the
+		// mutable viewport, losing every row that leaves the screen (#9780).
+		clearRenderCache();
+		const markdown = new Markdown("```sql\nSELECT 1;\nSELECT 2;\nSELECT 3;", 0, 0, defaultMarkdownTheme);
+		markdown.transientRenderCache = true;
+		markdown.render(80);
+		// The last two lines stay live: the newest is still being written, and the
+		// cut keeps one more so the publisher always has a tail to extend.
+		expect(markdown.getLastRenderStableText()).toBe("```sql\nSELECT 1;\n");
+
+		markdown.setText("```sql\nSELECT 1;\nSELECT 2;\nSELECT 3;\nSELECT 4;");
+		markdown.render(80);
+		expect(markdown.getLastRenderStableText()).toBe("```sql\nSELECT 1;\nSELECT 2;\n");
+	});
+
+	it("clears the settled fence text when a non-append edit rewinds it", () => {
+		// Regression: the stored prefix survived a rewind, so every later frame
+		// failed the prefix check and the block stayed unretirable for the rest
+		// of the stream.
+		clearRenderCache();
+		const markdown = new Markdown("```sql\nold\nrow\n", 0, 0, defaultMarkdownTheme);
+		markdown.transientRenderCache = true;
+		markdown.render(80);
+		expect(markdown.getLastRenderStableText()).toBe("```sql\nold\n");
+
+		markdown.setText("```sql\nnew\nrow\n");
+		markdown.render(80);
+		markdown.setText("```sql\nnew\nrow\nthird\nfourth\n");
+		markdown.render(80);
+		expect(markdown.getLastRenderStableText()).toBe("```sql\nnew\nrow\nthird\n");
 	});
 
 	it("keeps an open fence plain when the highlight stream factory rejects the language", () => {

@@ -1,10 +1,10 @@
 import * as path from "node:path";
-import { bytesMatchAscii } from "./bytes";
+import { bytesMatchAscii, indexOfAscii } from "./bytes";
 import { resolveArchiveLinkPath, upsertArchiveEntry } from "./entries";
 import { ArchiveError } from "./error";
 import {
 	type ArchiveLimits,
-	assertArchiveMemberSize,
+	assertArchiveMemberSizeField,
 	assertEntryCount,
 	assertIndexSize,
 	assertInMemorySize,
@@ -419,13 +419,6 @@ function paxDeclaresSparse(
 	return paxAttribute(globalPax, localPax, PAX_SPARSE_MARKER) === "1";
 }
 
-function indexOfAscii(bytes: Uint8Array, value: string, start: number): number {
-	for (let offset = start; offset <= bytes.byteLength - value.length; offset++) {
-		if (bytesMatchAscii(bytes, offset, value)) return offset;
-	}
-	return -1;
-}
-
 function normalizeOldGnuName(value: string, field: string, limits: ArchiveLimits): string {
 	const portable = value.replace(/\\/g, "/");
 	if (path.posix.isAbsolute(portable)) throw new ArchiveError(`Invalid old-GNU ${field}`);
@@ -750,7 +743,7 @@ async function readTarEntries(
 			continue;
 		}
 		if (typeFlag !== "0" && typeFlag !== "\0" && typeFlag !== "7" && typeFlag !== "S") continue;
-		assertArchiveMemberSize(displaySize, normalizedPath, limits);
+		assertArchiveMemberSizeField(displaySize, normalizedPath);
 		addEntry({
 			path: normalizedPath,
 			isDirectory: false,

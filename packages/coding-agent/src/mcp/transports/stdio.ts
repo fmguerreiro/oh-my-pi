@@ -28,7 +28,7 @@ import {
 } from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import { routeProgressNotification, withProgressToken } from "../progress";
-import { isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../timeout";
+import { isMCPTimeoutEnabled, resolveMCPRequestDeadline } from "../timeout";
 import { isThenable } from "../../utils/ipc";
 
 /** Subprocess argv and platform-derived spawn flags for an MCP stdio server. */
@@ -83,6 +83,7 @@ export interface ResolveStdioSpawnOptions {
 	env: Record<string, string | undefined>;
 	hostHasInheritableConsole?: boolean;
 	platform?: NodeJS.Platform;
+	signal?: AbortSignal;
 }
 
 const DEFAULT_WINDOWS_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"];
@@ -133,6 +134,7 @@ async function resolveWindowsCommandPath(
 	command: string,
 	cwd: string,
 	env: Record<string, string | undefined>,
+	signal?: AbortSignal,
 ): Promise<string | null> {
 	const extensions = getWindowsPathExt(env);
 	const hasExt = hasExecutableExtension(command, extensions);
@@ -140,6 +142,7 @@ async function resolveWindowsCommandPath(
 
 	if (hasPathSegment(command)) {
 		for (const candidate of candidates) {
+			signal?.throwIfAborted();
 			const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate);
 			if (await fileExists(resolved)) return resolved;
 		}
@@ -158,6 +161,7 @@ async function resolveWindowsCommandPath(
 	}
 	for (const dir of searchDirs) {
 		for (const candidate of candidates) {
+			signal?.throwIfAborted();
 			const resolved = path.join(dir, candidate);
 			if (await fileExists(resolved)) return resolved;
 		}
@@ -342,7 +346,7 @@ export async function resolveStdioSpawnCommand(
 	if (options.platform !== "win32") return { cmd: [config.command, ...args], detached: options.platform !== "darwin" };
 
 	const windowsHide = options.hostHasInheritableConsole === undefined ? true : !options.hostHasInheritableConsole;
-	const resolved = await resolveWindowsCommandPath(config.command, options.cwd, options.env);
+	const resolved = await resolveWindowsCommandPath(config.command, options.cwd, options.env, options.signal);
 	const resolvedCommand = resolved ?? config.command;
 	const npmShimCommand = await resolveWindowsNpmShimCommand(resolvedCommand, args, options.cwd, windowsHide);
 	if (npmShimCommand) return npmShimCommand;
@@ -418,6 +422,8 @@ export function writeFrame(stdin: FrameSink, frame: string): boolean {
 const TERM_GRACE_MS = 1000;
 /** Grace window to observe SIGKILL taking effect before `close()` gives up and returns. */
 const KILL_GRACE_MS = 500;
+/** Bun can report stdout EOF before `exited` settles; bound the wait for the exit status. */
+const EXIT_SETTLE_MS = 100;
 
 /**
  * The subset of `Subprocess` that termination needs. Decoupled from the
@@ -582,7 +588,8 @@ export class StdioTransport implements MCPTransport {
 	/**
 	 * Start the subprocess and begin reading.
 	 */
-	async connect(): Promise<void> {
+	async connect(signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
 		if (this.#connected) return;
 
 		const env = {
@@ -595,7 +602,10 @@ export class StdioTransport implements MCPTransport {
 			env,
 			platform: process.platform,
 			hostHasInheritableConsole: hostHasInheritableConsole(),
+			signal,
 		});
+		// Resolution may outlast the connection deadline, especially on Windows PATHs.
+		signal?.throwIfAborted();
 
 		// Platform-derived session and console-window handling come from
 		// `resolveStdioSpawnCommand`: Linux/other POSIX detach into their own
@@ -650,17 +660,29 @@ export class StdioTransport implements MCPTransport {
 			}
 		} finally {
 			if (this.#connected && closeError === undefined) {
-				const exitCode = this.#process?.exitCode;
+				const proc = this.#process;
+				let exitCode = proc?.exitCode;
+				let signalCode = proc?.signalCode;
+				// Bun reports stdout EOF before it settles `exited`, so `exitCode`
+				// can still be null here. Wait briefly for the status; a process that
+				// is genuinely still alive keeps the closed-stdout wording.
+				if (proc && (exitCode === null || exitCode === undefined)) {
+					await waitForProcessExit(proc.exited, EXIT_SETTLE_MS);
+					exitCode = proc.exitCode;
+					signalCode = proc.signalCode;
+				}
 				closeError = new MCPTransportError({
 					transport: "stdio",
 					stage: "receive",
 					failure: "eof",
 					message:
-						exitCode === null || exitCode === undefined
-							? "MCP subprocess closed stdout before responding"
-							: `MCP subprocess exited with code ${exitCode} before responding`,
+						exitCode !== null && exitCode !== undefined
+							? `MCP subprocess exited with code ${exitCode} before responding`
+							: signalCode
+								? `MCP subprocess was killed by ${signalCode} before responding`
+								: "MCP subprocess closed stdout before responding",
 					retryable: false,
-					code: exitCode ?? undefined,
+					code: exitCode ?? signalCode ?? undefined,
 				});
 			}
 			this.#handleClose(closeError);
@@ -797,7 +819,8 @@ export class StdioTransport implements MCPTransport {
 			params: options?.onProgress ? withProgressToken(params, id) : (params ?? {}),
 		};
 
-		const timeout = resolveMCPTimeoutMs(this.config.timeout);
+		const { timeoutMs: timeout, maxTotalMs } = resolveMCPRequestDeadline(this.config.timeout, method, params);
+		const startedAt = Date.now();
 		const signal = options?.signal;
 
 		if (signal?.aborted) {
@@ -845,8 +868,15 @@ export class StdioTransport implements MCPTransport {
 			if (settle(reason)) sendCancellation("Request cancelled by the client");
 		};
 
+		const progressSink = options?.onProgress;
 		this.#pendingRequests.set(id, {
-			onProgress: options?.onProgress,
+			// Progress shows the server is still working: restart the deadline.
+			onProgress: progressSink
+				? progress => {
+						if (timer) armTimer();
+						progressSink(progress);
+					}
+				: undefined,
 			resolve: (value: unknown) => {
 				settle(undefined, value);
 			},
@@ -855,7 +885,12 @@ export class StdioTransport implements MCPTransport {
 			},
 		});
 
-		if (isMCPTimeoutEnabled(timeout)) {
+		// Progress restarts the deadline, never past the request's hard cap.
+		const armTimer = (): void => {
+			const delay = Math.min(timeout, startedAt + maxTotalMs - Date.now());
+			if (delay <= 0) return;
+			const limit = delay < timeout ? maxTotalMs : timeout;
+			if (timer) clearTimeout(timer);
 			timer = setTimeout(() => {
 				if (
 					settle(
@@ -863,15 +898,16 @@ export class StdioTransport implements MCPTransport {
 							transport: "stdio",
 							stage: "receive",
 							failure: "timeout",
-							message: `Request timeout after ${timeout}ms`,
+							message: `Request timeout after ${limit}ms`,
 							retryable: false,
 						}),
 					)
 				) {
-					sendCancellation(`Request timed out after ${timeout}ms`);
+					sendCancellation(`Request timed out after ${limit}ms`);
 				}
-			}, timeout);
-		}
+			}, delay);
+		};
+		if (isMCPTimeoutEnabled(timeout)) armTimer();
 
 		if (signal) {
 			signal.addEventListener("abort", onAbort, { once: true });
@@ -990,10 +1026,13 @@ export class StdioTransport implements MCPTransport {
 /**
  * Create and connect a stdio transport.
  */
-export async function createStdioTransport(config: MCPStdioServerConfig): Promise<StdioTransport> {
+export async function createStdioTransport(
+	config: MCPStdioServerConfig,
+	signal?: AbortSignal,
+): Promise<StdioTransport> {
 	const transport = new StdioTransport(config);
 	try {
-		await transport.connect();
+		await transport.connect(signal);
 		return transport;
 	} catch (error) {
 		throw normalizeMCPTransportError(error, { transport: "stdio", stage: "connect" });

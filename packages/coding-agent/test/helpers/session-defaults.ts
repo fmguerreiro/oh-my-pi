@@ -4,12 +4,15 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 export function createSessionDefaults() {
 	return {
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		getMountedXdevToolNames: () => [],
 		waitForIdle: async () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,
 		getToolByName: () => undefined,
 		getLastAssistantMessage: () => undefined,
-		hasPendingAsyncWork: () => false,
+		isRunActive: false,
+		wakeSources: undefined,
+		waitForRunEnd: async () => {},
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
@@ -18,5 +21,6 @@ export function createSessionDefaults() {
 		isAdvisorActive: () => false,
 		subscribeRunState: () => () => {},
 		addDisposer: () => {},
+		getWorkPoolYieldItems: () => [],
 	} satisfies Partial<AgentSession>;
 }

@@ -331,6 +331,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "live_connect",
+				"doc": "Start a live voice session whose audio runs on a caller-owned WebRTC peer: send its SDP offer, apply the returned answer.",
+				"params": "LiveConnectParams",
+				"result": "LiveConnectResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "live_stop",
 				"doc": "Stop the live voice session, if any.",
 				"params": null,
@@ -530,7 +541,7 @@
 			},
 			{
 				"name": "bash",
-				"doc": "Run a shell command.",
+				"doc": "Run a shell command. Before excluding output, require ready.supportsBashExcludeFromContext to be true.",
 				"params": "BashParams",
 				"result": "BashResult",
 				"nullable": false,
@@ -555,6 +566,17 @@
 				"doc": "Session statistics.",
 				"params": null,
 				"result": "SessionStats",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "get_session_lease",
+				"doc": "Which of these sessions a running process (this one included) owns, probed without taking ownership. Ids in neither list are free; `unknown` could not be probed.",
+				"params": "GetSessionLeaseParams",
+				"result": "GetSessionLeaseResult",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -1148,6 +1170,25 @@
 			],
 			"x-open": true
 		},
+		"ParentIrc": {
+			"type": "object",
+			"properties": {
+				"from": {
+					"type": "string",
+					"description": "Sending parent agent id."
+				},
+				"body": {
+					"type": "string",
+					"description": "Message body as the parent wrote it."
+				}
+			},
+			"required": [
+				"from",
+				"body"
+			],
+			"description": "Parent-agent IRC message carried by a steer; render it instead of the model-facing `content` envelope.",
+			"x-open": true
+		},
 		"UserMessage": {
 			"type": "object",
 			"properties": {
@@ -1159,6 +1200,9 @@
 				},
 				"timestamp": {
 					"type": "number"
+				},
+				"parentIrc": {
+					"$ref": "#/$defs/ParentIrc"
 				},
 				"synthetic": {
 					"type": "boolean"
@@ -1455,6 +1499,9 @@
 				"details": {},
 				"attribution": {
 					"$ref": "#/$defs/Attribution"
+				},
+				"excludeFromContext": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -2252,8 +2299,7 @@
 				"pending",
 				"in_progress",
 				"completed",
-				"abandoned",
-				"blocked"
+				"abandoned"
 			],
 			"type": "string"
 		},
@@ -2323,10 +2369,6 @@
 				},
 				"status": {
 					"$ref": "#/$defs/TodoStatus"
-				},
-				"blocker": {
-					"type": "string",
-					"description": "What a `blocked` task is waiting on."
 				},
 				"details": {
 					"type": "string"
@@ -2673,7 +2715,7 @@
 				},
 				"hasPendingAsyncWork": {
 					"type": "boolean",
-					"description": "Background jobs or deliveries can still inject a follow-up and wake the session.",
+					"description": "Background jobs, their deliveries, child agents or queued peer messages can still wake the session.",
 					"default": false
 				},
 				"isSettled": {
@@ -2768,7 +2810,36 @@
 				"artifactElidedBytes": {
 					"type": "integer"
 				},
+				"elidedBytes": {
+					"type": "integer",
+					"description": "Bytes dropped from the middle of `output`, which keeps the head and tail."
+				},
+				"elidedLines": {
+					"type": "integer",
+					"description": "Lines dropped from the middle of `output`."
+				},
+				"columnDroppedBytes": {
+					"type": "integer",
+					"description": "Bytes the per-line column cap cut from `output`, across all lines."
+				},
+				"columnTruncatedLines": {
+					"type": "integer",
+					"description": "Lines of `output` the per-line column cap cut; the artifact holds them whole."
+				},
+				"columnTruncatedRange": {
+					"$ref": "#/$defs/LineRange",
+					"description": "First and last lines the column cap cut, numbered as in the artifact; absent when the numbering cannot match it."
+				},
+				"columnMax": {
+					"type": "integer",
+					"description": "The per-line column cap in UTF-8 bytes, set when it cut a line."
+				},
 				"artifactError": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {}
+				},
+				"minimized": {
 					"type": "object",
 					"properties": {},
 					"additionalProperties": {}
@@ -2781,6 +2852,16 @@
 					"items": {
 						"$ref": "#/$defs/ImageContent"
 					}
+				},
+				"trace": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {},
+					"description": "The embedded shell's final `ShellTrace` of the run; only when the caller asked for one."
+				},
+				"fork": {
+					"$ref": "#/$defs/ShellForkOutcome",
+					"description": "Set when the command overlapped another one on the session's persistent shell and ran in a fork of it."
 				}
 			},
 			"required": [
@@ -2791,6 +2872,38 @@
 				"totalBytes",
 				"outputLines",
 				"outputBytes"
+			]
+		},
+		"ShellForkOutcome": {
+			"type": "object",
+			"properties": {
+				"carried": {
+					"type": "boolean",
+					"description": "What the command set carried back into the session's shell; `false`: it stayed in the fork."
+				},
+				"jobs": {
+					"type": "boolean",
+					"description": "It left background jobs running in the fork, where later commands' `jobs`, `wait` and `%N` miss them."
+				}
+			},
+			"required": [
+				"carried",
+				"jobs"
+			]
+		},
+		"LineRange": {
+			"type": "object",
+			"properties": {
+				"first": {
+					"type": "integer"
+				},
+				"last": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"first",
+				"last"
 			]
 		},
 		"FastModeResult": {
@@ -3589,6 +3702,13 @@
 			],
 			"type": "string"
 		},
+		"CacheWarmingMethod": {
+			"enum": [
+				"prewarm",
+				"replay"
+			],
+			"type": "string"
+		},
 		"CacheWarmingOutcome": {
 			"enum": [
 				"hit",
@@ -3902,6 +4022,50 @@
 				"willRetry"
 			]
 		},
+		"ManualCompactionStartEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "manual_compaction_start"
+				},
+				"mode": {
+					"type": "string",
+					"description": "The `/compact <mode>` subcommand, when one was given."
+				}
+			},
+			"required": [
+				"type"
+			],
+			"description": "A manual compaction began. Handoff mode leaves live turns running and applies between turns or when idle."
+		},
+		"ManualCompactionEndEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "manual_compaction_end"
+				},
+				"aborted": {
+					"type": "boolean",
+					"description": "The compaction was cancelled (abort, or a `session_before_compact` hook)."
+				},
+				"result": {
+					"$ref": "#/$defs/CompactionResult",
+					"description": "Present when the compaction committed."
+				},
+				"skipped": {
+					"type": "boolean",
+					"description": "There was nothing to compact; `errorMessage` says why."
+				},
+				"errorMessage": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"aborted"
+			],
+			"description": "Outcome of the compaction announced by the matching `manual_compaction_start`."
+		},
 		"AutoRetryStartEvent": {
 			"type": "object",
 			"properties": {
@@ -3973,6 +4137,9 @@
 				"phase": {
 					"$ref": "#/$defs/CacheWarmingPhase"
 				},
+				"method": {
+					"$ref": "#/$defs/CacheWarmingMethod"
+				},
 				"provider": {
 					"type": "string"
 				},
@@ -3983,6 +4150,7 @@
 			"required": [
 				"type",
 				"phase",
+				"method",
 				"provider",
 				"model"
 			],
@@ -3996,6 +4164,9 @@
 				},
 				"phase": {
 					"$ref": "#/$defs/CacheWarmingPhase"
+				},
+				"method": {
+					"$ref": "#/$defs/CacheWarmingMethod"
 				},
 				"provider": {
 					"type": "string"
@@ -4018,6 +4189,7 @@
 			"required": [
 				"type",
 				"phase",
+				"method",
 				"provider",
 				"model",
 				"outcome"
@@ -4131,7 +4303,8 @@
 			"required": [
 				"type",
 				"rules"
-			]
+			],
+			"description": "Rule injection: a TTSR rule matched the stream and its text was injected. Each rule carries at least `name`, `path`, and `content`."
 		},
 		"TodoReminderEvent": {
 			"type": "object",
@@ -4329,6 +4502,12 @@
 					"$ref": "#/$defs/AutoCompactionEndEvent"
 				},
 				{
+					"$ref": "#/$defs/ManualCompactionStartEvent"
+				},
+				{
+					"$ref": "#/$defs/ManualCompactionEndEvent"
+				},
+				{
 					"$ref": "#/$defs/AutoRetryStartEvent"
 				},
 				{
@@ -4405,6 +4584,10 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"supportsBashExcludeFromContext": {
+					"type": "boolean",
+					"description": "`bash` accepts `excludeFromContext`; require exactly true before sending excluded commands."
 				}
 			},
 			"required": [
@@ -5057,6 +5240,29 @@
 						"$ref": "#/$defs/SelectOptionDetail"
 					}
 				},
+				"initialIndex": {
+					"type": "integer",
+					"description": "Index into `options` to focus first."
+				},
+				"selectionMarker": {
+					"enum": [
+						"radio",
+						"checkbox"
+					],
+					"type": "string",
+					"description": "Marker style for the first `markableCount` options."
+				},
+				"checkedIndices": {
+					"type": "array",
+					"items": {
+						"type": "integer"
+					},
+					"description": "For `checkbox`: indices into `options` currently checked. Authoritative; hosts render it per option."
+				},
+				"markableCount": {
+					"type": "integer",
+					"description": "Leading options that get a marker; trailing ones are actions. Defaults to all options when `selectionMarker` is set."
+				},
 				"timeout": {
 					"type": "integer"
 				}
@@ -5188,7 +5394,7 @@
 				"method",
 				"questions"
 			],
-			"description": "Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it."
+			"description": "Every question of one extension `ui.askDialog` call; sent only after `set_ask_dialog` enables it."
 		},
 		"CancelUiRequest": {
 			"type": "object",
@@ -5435,7 +5641,7 @@
 				"id",
 				"selectedOptions"
 			],
-			"description": "Answer to one `ask` question: exact option labels, plus optional free text."
+			"description": "Answer to one `ui.askDialog` question: exact option labels, plus optional free text."
 		},
 		"ValueUiResponse": {
 			"type": "object",
@@ -5498,7 +5704,7 @@
 				"id",
 				"cancelled"
 			],
-			"description": "Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers)."
+			"description": "Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` dialog then takes its recommended answers)."
 		},
 		"AnswersUiResponse": {
 			"type": "object",
@@ -6454,6 +6660,38 @@
 				"voice"
 			]
 		},
+		"LiveConnectParams": {
+			"type": "object",
+			"properties": {
+				"sdpOffer": {
+					"type": "string"
+				},
+				"voice": {
+					"type": "string"
+				},
+				"instructions": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"sdpOffer"
+			]
+		},
+		"LiveConnectResult": {
+			"type": "object",
+			"properties": {
+				"voice": {
+					"type": "string"
+				},
+				"sdpAnswer": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"voice",
+				"sdpAnswer"
+			]
+		},
 		"LiveMuteParams": {
 			"type": "object",
 			"properties": {
@@ -6639,10 +6877,48 @@
 			"properties": {
 				"command": {
 					"type": "string"
+				},
+				"excludeFromContext": {
+					"type": "boolean"
 				}
 			},
 			"required": [
 				"command"
+			]
+		},
+		"GetSessionLeaseParams": {
+			"type": "object",
+			"properties": {
+				"sessionIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"sessionIds"
+			]
+		},
+		"GetSessionLeaseResult": {
+			"type": "object",
+			"properties": {
+				"held": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"unknown": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"held",
+				"unknown"
 			]
 		},
 		"ExportHtmlParams": {

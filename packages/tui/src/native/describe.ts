@@ -77,6 +77,14 @@ export function withHidden(described: NativeNode, hidden: boolean): NativeNode {
 }
 
 /**
+ * `described` keyed `key` among its siblings and carrying `key` as its `motionKey`, so the nearest
+ * `transition: "layout"` container glides it when it moves, resizes, appears or leaves.
+ */
+export function withMotion(described: NativeNode, key: string): NativeNode {
+	return node(described.k, { ...described.p, motionKey: key } as TspProps, described.c, key);
+}
+
+/**
  * A described tree as the node tree a prop carries (a `hovercard`): plain
  * nodes only, since nothing reconciles inside a prop; component children
  * (which describe themselves per frame) are left out.
@@ -132,10 +140,15 @@ export function elapsed(age: number, stopped?: boolean): NativeNode {
 }
 
 /**
- * Keycap for one key id (`"ctrl+o"` → keys `["ctrl", "o"]`); the terminal
- * draws platform glyphs. A literal `+` key survives (`"+"`, `"ctrl++"`).
+ * The key names of one key id (`"ctrl+o"` → `["ctrl", "o"]`), as `kbd` and
+ * `button` `keys` take them. A literal `+` key survives (`"+"`, `"ctrl++"`).
  */
-export function kbd(key: string, nodeKey?: string): NativeNode {
+export function keyNames(key: string): string[] {
 	const keys = key === "+" ? ["+"] : key.endsWith("++") ? [...key.slice(0, -2).split("+"), "+"] : key.split("+");
-	return node("kbd", { keys: keys.filter(part => part.length > 0) }, undefined, nodeKey);
+	return keys.filter(part => part.length > 0);
+}
+
+/** Keycap for one key id ({@link keyNames}); the terminal draws platform glyphs. */
+export function kbd(key: string, nodeKey?: string): NativeNode {
+	return node("kbd", { keys: keyNames(key) }, undefined, nodeKey);
 }
