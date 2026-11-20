@@ -2515,6 +2515,27 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (!recoveredApprovedPlan && !suffixResolution) {
 					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, toolContext);
 					if (delimitedResult) return delimitedResult;
+					// A numeric pair can also be a literal filename plus a selector. Diagnose it only after lookup
+					// failed, and find the base the way a corrected read would: literally, else by unique suffix.
+					if (localTarget.sel && /^\d+$/.test(localTarget.sel)) {
+						const prefix = splitPathAndSel(localReadPath);
+						if (
+							prefix.sel &&
+							/^\d+$/.test(prefix.sel) &&
+							((await probeLiteralPathExists(prefix.path, this.session.cwd)) === "exists" ||
+								(!isRemoteMountPath(absolutePath) &&
+									(await findSuffixMatchCached(this.session, suffixCache, prefix.path, signal)) !== null))
+						) {
+							// `file:10:5` is usually a line and column; a reversed range would only fail again.
+							const range =
+								Number(localTarget.sel) > Number(prefix.sel)
+									? ` or :${prefix.sel}-${localTarget.sel} for a range`
+									: "";
+							throw new ToolError(
+								`Invalid line selector ':${prefix.sel}:${localTarget.sel}'. Use :${prefix.sel} for a single line${range}.`,
+							);
+						}
+					}
 					throw new ToolError(`Path '${localReadPath}' not found`);
 				}
 			} else {
